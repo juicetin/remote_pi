@@ -1,0 +1,15 @@
+{
+  "name": "remote-pi-repository",
+  "private": true,
+  "workspaces": [
+    "pi-extension"
+  ],
+  "scripts": {
+    "prepare": "npm run build --workspace pi-extension"
+  },
+  "pi": {
+    "extensions": [
+      "./pi-extension/dist"
+    ]
+  }
+}
