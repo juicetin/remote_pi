@@ -4,7 +4,7 @@ import 'dart:convert';
 import 'package:cockpit/app/cockpit/domain/contracts/task_runner_gateway.dart';
 import 'package:cockpit/app/cockpit/domain/contracts/terminal_scrollback_store.dart';
 import 'package:cockpit/app/cockpit/domain/entities/task_run.dart';
-import 'package:xterm/xterm.dart';
+import 'package:cockpit/app/core/terminal/xterm/xterm.dart';
 
 /// Mantém **um emulador [Terminal] por task**, alimentado continuamente pelo
 /// output do runner — independente de haver ou não uma aba aberta. É isso que
@@ -46,6 +46,10 @@ class TaskTerminalStore {
   /// Terminal da task (cria um vazio na primeira vez — read-only na UI). O
   /// `onResize` é ligado ao pty pra o output refluir ao tamanho do viewer; na
   /// primeira criação, semeia de forma assíncrona o output salvo em disco.
+  /// Terminal já existente da task, sem criar um vazio (leitura via CLI
+  /// `cockpit read-task` — criar aqui registraria um buffer fantasma).
+  Terminal? existingTerminal(String taskId) => _terminals[taskId];
+
   Terminal terminalFor(String taskId) => _terminals.putIfAbsent(taskId, () {
     final term = Terminal(maxLines: 10000);
     term.onResize = (w, h, pw, ph) => _runner.resize(taskId, h, w);

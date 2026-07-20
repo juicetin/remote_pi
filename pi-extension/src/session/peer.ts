@@ -3,6 +3,18 @@ import { setTimeout as delay } from "node:timers/promises";
 import { type Envelope, envelope, parse, serialize, EnvelopeError } from "./envelope.js";
 import { joinOrLead, type ElectionResult } from "./leader_election.js";
 import { Broker } from "./broker.js";
+import {
+  MESH_PROTOCOL_VERSION,
+  MeshRegistrationError,
+  isLogicalAgentId,
+  type RegisterAck,
+  type RegisterErrorFrame,
+  type RegisterRequest,
+  type RenameAck,
+  type RenameRequest,
+} from "./mesh_protocol.js";
+
+export { MeshRegistrationError } from "./mesh_protocol.js";
 
 /**
  * Symmetric peer-in-session API. Hides whether you are leader or follower;
@@ -19,21 +31,15 @@ export type ReconnectHandler = () => void;
 export interface SessionPeerOptions {
   sockPath: string;
   name: string;
-  /**
-   * Working directory of this agent. Sent in the `register` so the broker can
-   * key peers by the (cwd, name) pair: two agents in the SAME folder with the
-   * same name are the SAME logical agent reincarnating (switch_session /
-   * restart), so the broker take-over the name instead of suffixing `#N`.
-   * Optional for backward-compat with peers that predate this field.
-   */
+  /** Stable identity of one logical agent runtime. It is not a routing name. */
+  logicalAgentId: string;
+  /** Working directory used only to scope the human-readable routing address. */
   cwd?: string;
-  /** Replace an existing same-(cwd,name) registration instead of accepting a
-   *  broker-assigned `#N`. Use only for stable logical identities; ordinary
-   *  multi-agent sessions should leave this false. */
-  takeoverExisting?: boolean;
   auditPath?: string;
   /** Per-request default timeout (ms). Override per call if needed. */
   defaultTimeoutMs?: number;
+  /** Registration timeout override for deterministic transport tests. */
+  registrationTimeoutMs?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -61,9 +67,8 @@ export class SessionPeer {
   /** Clean leaf name actually assigned by the broker (may carry a `#N`
    *  collision suffix). Used for display + self-filtering. */
   private assignedName: string;
-  /** Canonical address assigned by the broker (`[<pc>:]<cwd>@<nome>`, or just
-   *  the name for a legacy broker). This is the routing/identity key the mesh
-   *  uses; callers ECHO it, never compose it. */
+  /** Canonical routing address assigned by the broker. Callers echo it and
+   *  never compose it. This address is separate from logical ownership. */
   private assignedAddress: string;
   private role: "leader" | "follower" = "follower";
   private broker: Broker | null = null;
@@ -83,8 +88,16 @@ export class SessionPeer {
   private readonly handlers = new Set<MessageHandler>();
   private readonly reconnectHandlers = new Set<ReconnectHandler>();
   private leftFlag = false;
+  private terminalRegistrationFailure = false;
+  private renameAckListener: ((raw: unknown) => boolean) | null = null;
 
   constructor(opts: SessionPeerOptions) {
+    if (!isLogicalAgentId(opts.logicalAgentId)) {
+      throw new MeshRegistrationError(
+        "invalid_logical_agent_id",
+        "logicalAgentId must be a non-empty string",
+      );
+    }
     this.opts = opts;
     this.assignedName = opts.name;
     this.assignedAddress = opts.name;
@@ -215,16 +228,48 @@ export class SessionPeer {
     return () => this.reconnectHandlers.delete(handler);
   }
 
-  /**
-   * Requests a different display name from the broker. Returns the name
-   * actually assigned (may carry a #N suffix on collision). Implemented as
-   * a soft rejoin: leaves & rejoins with the new name.
-   */
+  /** Rename the routing address without releasing logical ownership. */
   async rename(newName: string): Promise<string> {
-    await this._teardownConn();
-    this.opts.name = newName;
-    this.assignedName = newName;
-    return this._joinOrLead();
+    const sock = this.socket;
+    if (!sock || sock.destroyed) throw new Error("session peer not connected");
+
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.renameAckListener = null;
+        reject(new Error("rename_ack timeout"));
+      }, 5_000);
+      this.renameAckListener = (raw) => {
+        const ack = raw as Partial<RenameAck>;
+        if (ack.type !== "rename_ack") return false;
+        clearTimeout(timer);
+        this.renameAckListener = null;
+        if (
+          ack.protocol_version !== MESH_PROTOCOL_VERSION ||
+          typeof ack.name_assigned !== "string" ||
+          typeof ack.address_assigned !== "string"
+        ) {
+          reject(new Error("invalid rename_ack"));
+          return true;
+        }
+        this.opts.name = newName;
+        this.assignedName = ack.name_assigned;
+        this.assignedAddress = ack.address_assigned;
+        resolve(ack.name_assigned);
+        return true;
+      };
+      const req: RenameRequest = {
+        type: "rename",
+        protocol_version: MESH_PROTOCOL_VERSION,
+        name: newName,
+      };
+      try {
+        sock.write(JSON.stringify(req) + "\n");
+      } catch (error) {
+        clearTimeout(timer);
+        this.renameAckListener = null;
+        reject(error as Error);
+      }
+    });
   }
 
   async leave(): Promise<void> {
@@ -277,39 +322,68 @@ export class SessionPeer {
   private _registerOver(sock: Socket): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       // The first inbound line MUST be the register_ack. Buffer-aware.
-      const wait = setTimeout(() => reject(new Error("register_ack timeout")), 5_000);
+      const wait = setTimeout(() => {
+        this.terminalRegistrationFailure = true;
+        this._preAckListener = null;
+        sock.destroy();
+        reject(new Error("register_ack timeout"));
+      }, this.opts.registrationTimeoutMs ?? 5_000);
       const onceListener = (raw: unknown) => {
         clearTimeout(wait);
         // plan/38: a new broker returns `address_assigned` (canonical key) +
         // `name_assigned` (clean leaf). Read both with cross-fallback so we work
         // against either a new broker OR a legacy one (only `name_assigned`,
         // where address == name).
-        const ack = raw as { type?: string; name_assigned?: string; address_assigned?: string };
-        const name = typeof ack?.name_assigned === "string" ? ack.name_assigned : ack?.address_assigned;
-        const address = typeof ack?.address_assigned === "string" ? ack.address_assigned : ack?.name_assigned;
-        if (ack && ack.type === "register_ack" && typeof name === "string" && typeof address === "string") {
-          this.assignedName = name;
-          this.assignedAddress = address;
+        const frame = raw as { type?: unknown };
+        if (frame.type === "register_error") {
+          const errorFrame = raw as Partial<RegisterErrorFrame>;
+          this.terminalRegistrationFailure = true;
           this._preAckListener = null;
-          resolve(name);
-        } else {
-          reject(new Error(`expected register_ack, got: ${JSON.stringify(raw)}`));
+          const error = new MeshRegistrationError(
+            errorFrame.code ?? "unsupported_protocol",
+            errorFrame.message ?? "mesh registration rejected",
+            errorFrame.owner_address,
+          );
+          reject(error);
+          sock.destroy();
+          return;
         }
+        const ack = raw as Partial<RegisterAck>;
+        if (
+          ack.type === "register_ack" &&
+          ack.protocol_version === MESH_PROTOCOL_VERSION &&
+          typeof ack.name_assigned === "string" &&
+          typeof ack.address_assigned === "string"
+        ) {
+          this.assignedName = ack.name_assigned;
+          this.assignedAddress = ack.address_assigned;
+          this._preAckListener = null;
+          resolve(ack.name_assigned);
+          return;
+        }
+        this.terminalRegistrationFailure = true;
+        this._preAckListener = null;
+        reject(new MeshRegistrationError(
+          "unsupported_protocol",
+          `expected register_ack protocol v${MESH_PROTOCOL_VERSION}`,
+        ));
+        sock.destroy();
       };
       this._preAckListener = onceListener;
-      const req = JSON.stringify({
+      const req: RegisterRequest = {
         type: "register",
+        protocol_version: MESH_PROTOCOL_VERSION,
+        logical_agent_id: this.opts.logicalAgentId,
         name: this.opts.name,
-        // Only include cwd when set — keeps the wire identical to the legacy
-        // payload for callers that don't supply it (broker treats absent cwd
-        // as "no take-over", i.e. the old #N behavior).
         ...(this.opts.cwd !== undefined ? { cwd: this.opts.cwd } : {}),
-        ...(this.opts.takeoverExisting === true ? { takeover: true } : {}),
-      }) + "\n";
+      };
       try {
-        sock.write(req);
+        sock.write(JSON.stringify(req) + "\n");
       } catch (e) {
         clearTimeout(wait);
+        this.terminalRegistrationFailure = true;
+        this._preAckListener = null;
+        sock.destroy();
         reject(e as Error);
       }
     });
@@ -338,6 +412,13 @@ export class SessionPeer {
         // Garbage during register window — ignore.
       }
       return;
+    }
+
+    if (this.renameAckListener) {
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        if (this.renameAckListener(parsed)) return;
+      } catch { /* envelope parser below handles malformed input */ }
     }
 
     // Regular envelope.
@@ -399,7 +480,7 @@ export class SessionPeer {
   }
 
   private async _onSocketClose(closedSock: Socket): Promise<void> {
-    if (this.leftFlag) return;  // intentional leave
+    if (this.leftFlag || this.terminalRegistrationFailure) return;
     // Only the CURRENT socket dying is a real failover. A close from a socket
     // we've already replaced — `rename()` (teardown + rejoin) or a prior
     // reconnect — must NOT trigger another `_joinOrLead`, or we'd double-

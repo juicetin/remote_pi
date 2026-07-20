@@ -1,5 +1,13 @@
 import 'dart:io';
 
+import 'package:cockpit/app/cockpit/domain/contracts/db_connection_store.dart';
+import 'package:cockpit/app/cockpit/domain/contracts/db_driver.dart';
+import 'package:cockpit/app/cockpit/domain/contracts/nosql_runner.dart';
+import 'package:cockpit/app/cockpit/data/db/db_connection_store_impl.dart';
+import 'package:cockpit/app/cockpit/data/db/db_driver_registry_impl.dart';
+import 'package:cockpit/app/cockpit/data/db/nosql_command_runner.dart';
+import 'package:cockpit/app/cockpit/domain/services/db_query_service.dart';
+import 'package:cockpit/app/cockpit/data/db/db_secrets_impl.dart';
 import 'package:cockpit/app/cockpit/data/filesystem/app_launcher_impl.dart';
 import 'package:cockpit/app/cockpit/data/filesystem/content_searcher_impl.dart';
 import 'package:cockpit/app/cockpit/data/filesystem/file_reader_impl.dart';
@@ -16,7 +24,9 @@ import 'package:cockpit/app/cockpit/data/filesystem/worktree_manager_impl.dart';
 import 'package:cockpit/app/cockpit/data/notifications/local_notifier.dart';
 import 'package:cockpit/app/cockpit/data/repositories/hive_dismissed_update_store.dart';
 import 'package:cockpit/app/cockpit/data/repositories/hive_project_repository.dart';
+import 'package:cockpit/app/cockpit/data/repositories/hive_realm_repository.dart';
 import 'package:cockpit/app/cockpit/data/repositories/hive_workspace_layout_store.dart';
+import 'package:cockpit/app/cockpit/data/repositories/project_schema_migrator.dart';
 import 'package:cockpit/app/cockpit/data/rpc/pi_rpc_process_factory.dart';
 import 'package:cockpit/app/cockpit/data/setup/environment_installer_impl.dart';
 import 'package:cockpit/app/cockpit/data/hooks/terminal_status_server_impl.dart';
@@ -42,6 +52,7 @@ import 'package:cockpit/app/cockpit/domain/contracts/git_diff_reader.dart';
 import 'package:cockpit/app/cockpit/domain/contracts/git_status_reader.dart';
 import 'package:cockpit/app/cockpit/domain/contracts/notifier.dart';
 import 'package:cockpit/app/cockpit/domain/contracts/project_repository.dart';
+import 'package:cockpit/app/cockpit/domain/contracts/realm_repository.dart';
 import 'package:cockpit/app/cockpit/domain/contracts/rpc_gateway_factory.dart';
 import 'package:cockpit/app/cockpit/domain/contracts/self_updater.dart';
 import 'package:cockpit/app/cockpit/domain/contracts/session_history.dart';
@@ -57,12 +68,15 @@ import 'package:cockpit/app/cockpit/domain/contracts/worktree_manager.dart';
 import 'package:cockpit/app/cockpit/domain/value_objects/update_target.dart';
 import 'package:cockpit/app/cockpit/ui/cockpit_page.dart';
 import 'package:cockpit/app/cockpit/ui/viewmodels/cockpit_viewmodel.dart';
+import 'package:cockpit/app/cockpit/ui/viewmodels/git_controller.dart';
+import 'package:cockpit/app/cockpit/ui/viewmodels/realm_controller.dart';
+import 'package:cockpit/app/cockpit/ui/viewmodels/database_viewmodel.dart';
 import 'package:cockpit/app/cockpit/ui/session/task_terminal_store.dart';
 import 'package:cockpit/app/cockpit/ui/viewmodels/setup_viewmodel.dart';
 import 'package:cockpit/app/cockpit/ui/viewmodels/tasks_viewmodel.dart';
 import 'package:cockpit/app/cockpit/ui/viewmodels/update_viewmodel.dart';
 import 'package:cockpit/app/core/data/repositories/hive_settings_store.dart';
-import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint, kReleaseMode;
 import 'package:flutter_modular/flutter_modular.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -92,6 +106,10 @@ Future<Module> buildCockpitModule() async {
   final layoutBox = await Hive.openBox<dynamic>(
     HiveWorkspaceLayoutStore.boxName,
   );
+  final realmBox = await Hive.openBox<dynamic>(HiveRealmRepository.boxName);
+  // Schema pré-realm (id == path) → UUID + realm. Idempotente; roda antes de
+  // qualquer bind ler as boxes.
+  await const ProjectSchemaMigrator().run(projectBox, layoutBox);
   // Updates dispensados moram na box de settings (mesma do SettingsController);
   // `openBox` é idempotente → devolve a instância já aberta pelo `main`.
   final settingsBox = await Hive.openBox<dynamic>(HiveSettingsStore.boxName);
@@ -110,6 +128,7 @@ Future<Module> buildCockpitModule() async {
     register: (c) {
       c
         ..addInstance<ProjectRepository>(HiveProjectRepository(projectBox))
+        ..addInstance<RealmRepository>(HiveRealmRepository(realmBox))
         ..addInstance<WorkspaceLayoutStore>(HiveWorkspaceLayoutStore(layoutBox))
         ..addInstance<DismissedUpdateStore>(
           HiveDismissedUpdateStore(settingsBox),
@@ -121,6 +140,13 @@ Future<Module> buildCockpitModule() async {
         ..addInstance<FileSystemReader>(const FileSystemReaderImpl())
         ..addInstance<FileSystemMutator>(const FileSystemMutatorImpl())
         ..addInstance<FileReader>(const FileReaderImpl())
+        // DB tab (plano 51): conexões por workspace + drivers + motor
+        // compartilhado tab/CLI.
+        ..addInstance<DbConnectionStore>(const DbConnectionStoreImpl())
+        ..addInstance<DbSecrets>(const DbSecretsImpl())
+        ..addInstance<DbDriverRegistry>(const DbDriverRegistryImpl())
+        ..addInstance<NoSqlRunner>(const NoSqlRunnerImpl())
+        ..addLazySingleton<DbQueryService>(DbQueryService.new)
         ..addInstance<FileSearcher>(FileSearcherImpl())
         ..addInstance<ContentSearcher>(const ContentSearcherImpl())
         ..addInstance<GitBinary>(GitBinary())
@@ -152,10 +178,15 @@ Future<Module> buildCockpitModule() async {
           // o construtor a partir dos binds acima. Os `init()`/`check()` (que
           // antes encadeavam no factory) agora rodam no `CockpitPage.initState`.
           provide: (s) => s
+            // Estado git extraído do CockpitViewModel (mesma vida da rota);
+            // o VM o recebe no construtor e injeta o contexto de shell.
+            ..addChangeNotifier<GitController>(GitController.new)
+            ..addChangeNotifier<RealmController>(RealmController.new)
             ..addChangeNotifier<CockpitViewModel>(CockpitViewModel.new)
             ..addChangeNotifier<SetupViewModel>(SetupViewModel.new)
             ..addChangeNotifier<TasksViewModel>(TasksViewModel.new)
-            ..addChangeNotifier<UpdateViewModel>(UpdateViewModel.new),
+            ..addChangeNotifier<UpdateViewModel>(UpdateViewModel.new)
+            ..addChangeNotifier<DatabaseViewModel>(DatabaseViewModel.new),
           child: (context, state) => const CockpitPage(),
         );
     },
@@ -205,6 +236,11 @@ UpdateTarget _updateTarget(String version) {
 /// artefato em background por conta própria. O WinSparkle exige o clique do
 /// usuário pra baixar+instalar — ver doc do [AutoUpdaterSelfUpdater].
 SelfUpdater _buildSelfUpdater(UpdateTarget target) {
+  // Em debug/profile (flutter run) o Sparkle é veneno: o bundle id é o mesmo do
+  // app instalado, o check acha release novo e o Autoupdate MATA o processo pra
+  // instalar/relançar — o run morre com "Lost connection to device" sem erro.
+  // Self-update só faz sentido no build release distribuído.
+  if (!kReleaseMode) return const NoopSelfUpdater();
   final feed = target.selfUpdateFeedUrl;
   if (feed == null) return const NoopSelfUpdater();
   return AutoUpdaterSelfUpdater(feedUrl: feed, autoDownloads: Platform.isMacOS);

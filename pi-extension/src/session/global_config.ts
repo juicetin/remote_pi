@@ -28,7 +28,9 @@ export function ensureGlobalDirs(): void {
  * both the same; only the address string differs.
  */
 export function sessionSockPath(name: string): string {
-  return ipcAddress(`broker-${name}`, join(SESSIONS_DIR, name, "broker.sock"));
+  // Protocol v2 uses a separate endpoint so a new client can never become
+  // briefly routable through an already-running v1 broker during rollout.
+  return ipcAddress(`broker-v2-${name}`, join(SESSIONS_DIR, name, "broker-v2.sock"));
 }
 
 /** Path to the audit log for a named session. */

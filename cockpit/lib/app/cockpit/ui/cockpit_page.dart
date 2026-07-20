@@ -16,7 +16,15 @@ import 'package:cockpit/app/core/ui/themes/themes.dart';
 import 'package:cockpit/app/core/ui/settings_controller.dart';
 import 'package:cockpit/app/core/ui/widgets/hover_tap.dart';
 import 'package:cockpit/app/core/utils/native_folder_picker.dart';
-import 'package:flutter/services.dart' show LogicalKeyboardKey;
+import 'package:flutter/services.dart'
+    show
+        HardwareKeyboard,
+        KeyDownEvent,
+        KeyEvent,
+        KeyRepeatEvent,
+        LogicalKeyboardKey,
+        PhysicalKeyboardKey;
+import 'package:cockpit/app/core/ui/widgets/app_tooltip.dart';
 import 'package:shadcn_flutter/shadcn_flutter.dart';
 import 'package:flutter_modular/flutter_modular.dart';
 
@@ -76,6 +84,13 @@ class _CockpitPageState extends State<CockpitPage> {
     _workspaceMenu = context.read<WorkspaceMenuBridge>();
     _menuVm = context.read<CockpitViewModel>()..addListener(_syncWorkspaceMenu);
     _syncWorkspaceMenu();
+    // Navegação direcional entre panes (⌘⌥ + setas). Vai por um handler global
+    // do HardwareKeyboard — e NÃO pelo menu — porque no macOS as setas não
+    // funcionam como *key equivalent* de menu (o campo/terminal focado consome a
+    // seta antes do menu). O handler global vê o evento antes da distribuição por
+    // foco, então pega mesmo com um terminal focado. Ver [_handlePaneNavKey].
+    HardwareKeyboard.instance.addHandler(_handlePaneNavKey);
+    HardwareKeyboard.instance.addHandler(_realmKeyHandler);
     // Mantém os overrides de comando do LSP (tela "Language") em sync com o pool:
     // empurra o estado atual e re-empurra a cada mudança das Configurações.
     _settings = context.read<SettingsController>()
@@ -129,6 +144,12 @@ class _CockpitPageState extends State<CockpitPage> {
       onSplitDown: () => _splitFocused(SplitDir.horizontal),
       onToggleRail: vm.toggleRail,
       onToggleFiles: vm.toggleTree,
+      onSelectTab: vm.selectTabByIndex,
+      onSelectLastTab: vm.selectLastTab,
+      onFocusPaneLeft: () => vm.focusPaneToward(PaneMove.left),
+      onFocusPaneRight: () => vm.focusPaneToward(PaneMove.right),
+      onFocusPaneUp: () => vm.focusPaneToward(PaneMove.up),
+      onFocusPaneDown: () => vm.focusPaneToward(PaneMove.down),
     );
   }
 
@@ -181,8 +202,38 @@ class _CockpitPageState extends State<CockpitPage> {
     _lastLspCommands = Map<String, String>.of(next);
   }
 
+  /// Handler global de teclado pra navegação direcional entre panes. Roda antes
+  /// da distribuição por foco (por isso pega ⌘⌥+seta mesmo com terminal focado,
+  /// onde o menu nativo do macOS falharia). Consome (retorna `true`) só o combo
+  /// exato ⌘⌥ (macOS) / Ctrl+⌥ (Win/Linux) + seta; qualquer outra tecla passa.
+  bool _handlePaneNavKey(KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return false;
+    final move = switch (event.logicalKey) {
+      LogicalKeyboardKey.arrowLeft => PaneMove.left,
+      LogicalKeyboardKey.arrowRight => PaneMove.right,
+      LogicalKeyboardKey.arrowUp => PaneMove.up,
+      LogicalKeyboardKey.arrowDown => PaneMove.down,
+      _ => null,
+    };
+    if (move == null) return false;
+    final pressed = HardwareKeyboard.instance.logicalKeysPressed;
+    final primary =
+        pressed.contains(LogicalKeyboardKey.metaLeft) ||
+        pressed.contains(LogicalKeyboardKey.metaRight) ||
+        pressed.contains(LogicalKeyboardKey.controlLeft) ||
+        pressed.contains(LogicalKeyboardKey.controlRight);
+    final alt =
+        pressed.contains(LogicalKeyboardKey.altLeft) ||
+        pressed.contains(LogicalKeyboardKey.altRight);
+    if (!primary || !alt) return false;
+    _menuVm?.focusPaneToward(move);
+    return true;
+  }
+
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handlePaneNavKey);
+    HardwareKeyboard.instance.removeHandler(_realmKeyHandler);
     _settings?.removeListener(_syncLspCommands);
     _settings?.removeListener(_syncNotifications);
     _settings?.removeListener(_syncCockpit);
@@ -317,35 +368,71 @@ class _CockpitPageState extends State<CockpitPage> {
     }
   }
 
+  /// Rótulo da operação git: nome do workspace em single-root; basename da
+  /// root em multi-root (a root já veio escolhida do submenu do kebab).
+  String _gitOpLabel(Project project, String rootPath) =>
+      rootPath == project.path ? project.name : rootPath.split('/').last;
+
   /// "Criar worktree": busca o namespace (branches + worktrees) pra validação ao
   /// vivo e abre o dialog. O dialog roda o `git worktree add` via `onCreate` e a
   /// VM auto-seleciona o fork novo (decisões 14, 21).
   /// Sync (pull → push) do workspace, com o processo ao vivo num dialog.
-  Future<void> _syncProject(Project project) async {
-    final run = _vm.gitSync(project.path);
+  Future<void> _syncProject(Project project, String rootPath) async {
+    final run = _vm.gitSync(rootPath);
     await showGitProcessDialog(
       context,
-      title: 'Sync — ${project.name}',
+      title: 'Sync — ${_gitOpLabel(project, rootPath)}',
       output: run.output,
       success: run.exitCode.then((c) => c == 0),
     );
   }
 
-  Future<void> _pullProject(Project project) async {
-    final run = _vm.gitPull(project.path);
+  Future<void> _pullProject(Project project, String rootPath) async {
+    final run = _vm.gitPull(rootPath);
     await showGitProcessDialog(
       context,
-      title: 'Pull — ${project.name}',
+      title: 'Pull — ${_gitOpLabel(project, rootPath)}',
       output: run.output,
       success: run.exitCode.then((c) => c == 0),
     );
   }
 
-  Future<void> _pushProject(Project project) async {
-    final run = _vm.gitPush(project.path);
+  Future<void> _pushProject(Project project, String rootPath) async {
+    final run = _vm.gitPush(rootPath);
     await showGitProcessDialog(
       context,
-      title: 'Push — ${project.name}',
+      title: 'Push — ${_gitOpLabel(project, rootPath)}',
+      output: run.output,
+      success: run.exitCode.then((c) => c == 0),
+    );
+  }
+
+  /// "Fork Worktree": nova worktree ramificada da branch do fork [base] —
+  /// mesmo dialog do criar, validando contra o namespace do repo de origem.
+  Future<void> _forkWorktree(Project base) async {
+    final vm = _vm;
+    final namespace = await vm.forkWorktreeNamespace(base.id);
+    if (!mounted) return;
+    await showWorktreeCreateDialog(
+      context,
+      rootName: base.name,
+      namespace: namespace,
+      fork: true,
+      onCreate: (name) async {
+        final res = await vm.forkWorktree(base.id, name);
+        return res.fold((_) => null, (e) => e.message);
+      },
+    );
+  }
+
+  /// "Update from Parent": mergeia a branch do pai (root de origem) no
+  /// worktree — o inverso do merge. Conflito fica no worktree pro usuário
+  /// resolver (o dialog mostra a saída do git).
+  Future<void> _updateWorktree(Project fork) async {
+    final run = _vm.updateWorktreeFromParent(fork);
+    await showGitProcessDialog(
+      context,
+      title: 'Update from Parent — ${fork.name}',
       output: run.output,
       success: run.exitCode.then((c) => c == 0),
     );
@@ -366,20 +453,58 @@ class _CockpitPageState extends State<CockpitPage> {
     );
   }
 
-  Future<void> _createWorktree(Project root) async {
+  Future<void> _createWorktree(Project root, String rootPath) async {
     final vm = _vm;
-    final namespace = await vm.worktreeNamespace(root.id);
+    // Multi-root: a worktree é de UMA root — a escolha já veio do submenu do
+    // kebab (o fork nasce como filho single-root apontando pro checkout dela).
+    final namespace = await vm.worktreeNamespace(root.id, rootPath: rootPath);
     if (!mounted) return;
     await showWorktreeCreateDialog(
       context,
-      rootName: root.name,
+      rootName: _gitOpLabel(root, rootPath),
       namespace: namespace,
       onCreate: (name) async {
-        final res = await vm.createWorktree(root.id, name);
+        final res = await vm.createWorktree(root.id, name, rootPath: rootPath);
         return res.fold((_) => null, (e) => e.message);
       },
     );
   }
+
+  /// Destinos de "Move to realm" do kebab: todos os realms menos o atual do
+  /// workspace; destino que já tem o mesmo path vem desabilitado. Com um realm
+  /// só, lista vazia → item nem aparece.
+  List<RealmTarget> _moveTargets(CockpitViewModel vm, String projectId) {
+    if (vm.realms.length < 2) return const [];
+    final matches = vm.projects.where((p) => p.id == projectId);
+    if (matches.isEmpty) return const [];
+    final project = matches.first;
+    return [
+      for (final realm in vm.realms)
+        if (realm.id != project.realmId)
+          (
+            id: realm.id,
+            name: realm.name,
+            enabled: !vm.pathExistsInRealm(project.path, realm.id),
+          ),
+    ];
+  }
+
+  /// "New realm…" do dropdown do footer: pede o nome e já troca pro realm novo
+  /// (nasce vazio — o rail mostra o estado vazio pra adicionar workspaces).
+  Future<void> _createRealm() async {
+    final vm = _vm;
+    final name = await showRealmNameDialog(
+      context,
+      title: 'New realm',
+      confirmLabel: 'Create',
+      takenNames: vm.realms.map((r) => r.name).toSet(),
+    );
+    if (name == null) return;
+    final realm = await vm.createRealm(name);
+    await vm.switchRealm(realm.id);
+  }
+
+  Future<void> _manageRealms() => showRealmManagerDialog(context, vm: _vm);
 
   /// "Fechar" o workspace (confirma → remove da lista local + encerra agentes).
   /// **Não deleta** a pasta no disco — só sai do cockpit.
@@ -506,6 +631,30 @@ class _CockpitPageState extends State<CockpitPage> {
         _focusContentSearch,
   };
 
+  /// ⌘`/Ctrl+` próximo realm; com Shift, anterior. Handler **global** no
+  /// [HardwareKeyboard] (registrado no initState), não um `CallbackShortcuts`:
+  ///
+  /// - `CallbackShortcuts` só recebe teclas com o foco primário DENTRO da
+  ///   subtree — ciclar o realm destrói o nó focado (terminal/agente da árvore
+  ///   antiga), o foco cai pro scope raiz e o atalho morria após o 1º uso;
+  /// - casa pela **physical key**: a logical de ⇧` no macOS vira `~` (e a
+  ///   combinação ⌘⇧ não batia com backquote nem tilde de forma confiável) —
+  ///   pela física, Shift só decide a direção.
+  ///
+  /// Só `KeyDownEvent` (repeat não re-dispara); com Alt junto, ignora.
+  bool _realmKeyHandler(KeyEvent event) {
+    if (event is! KeyDownEvent ||
+        event.physicalKey != PhysicalKeyboardKey.backquote) {
+      return false;
+    }
+    final keys = HardwareKeyboard.instance;
+    if ((!keys.isMetaPressed && !keys.isControlPressed) || keys.isAltPressed) {
+      return false;
+    }
+    unawaited(_vm.cycleRealm(keys.isShiftPressed ? -1 : 1));
+    return true;
+  }
+
   @override
   Widget build(BuildContext context) {
     final vm = context.watch<CockpitViewModel>();
@@ -550,12 +699,24 @@ class _CockpitPageState extends State<CockpitPage> {
                             selectedId: vm.selectedProjectId,
                             notificationCount: vm.notificationCount,
                             gitInfo: vm.gitInfo,
+                            rootsSummary: vm.rootsGitSummary,
+                            forkOriginName: vm.forkOriginName,
+                            rootsOf: (id) => [
+                              for (final r in vm.rootsOf(id))
+                                (
+                                  path: r,
+                                  name: r.split('/').last,
+                                  git: vm.gitInfoForRoot(r),
+                                ),
+                            ],
                             onSelect: vm.selectProject,
                             onAdd: _createWorkspace,
                             onConfigure: _configureProject,
                             onDelete: _deleteProject,
                             onCreateWorktree: _createWorktree,
                             onRemoveWorktree: _removeWorktree,
+                            onUpdateWorktree: _updateWorktree,
+                            onForkWorktree: _forkWorktree,
                             onMergeWorktree: _mergeWorktree,
                             onSync: _syncProject,
                             onPull: _pullProject,
@@ -568,6 +729,17 @@ class _CockpitPageState extends State<CockpitPage> {
                                 ),
                             onOpenSettings: () =>
                                 context.pushNamed(RoutePaths.settings),
+                            realms: vm.realms,
+                            activeRealm: vm.activeRealm,
+                            onSwitchRealm: (id) =>
+                                unawaited(vm.switchRealm(id)),
+                            onCreateRealm: _createRealm,
+                            onManageRealms: _manageRealms,
+                            moveTargetsOf: (projectId) =>
+                                _moveTargets(vm, projectId),
+                            onMoveToRealm: (projectId, realmId) => unawaited(
+                              vm.moveWorkspaceToRealm(projectId, realmId),
+                            ),
                             cockpit: vm.cockpitWorkspace,
                             onSelectCockpit: () =>
                                 vm.selectProject(Project.cockpitId),
@@ -619,6 +791,21 @@ class _CockpitPageState extends State<CockpitPage> {
                             key: ValueKey(vm.selectedProject?.path ?? ''),
                             width: _treeWidth,
                             rootPath: vm.selectedProject?.path ?? '',
+                            // Roots derivadas (multi-root = seções por repo).
+                            roots: [
+                              for (final r
+                                  in vm.selectedProject == null
+                                      ? const <String>[]
+                                      : vm.rootsOf(vm.selectedProject!.id))
+                                WorkspaceRoot(
+                                  path: r,
+                                  name: r.split('/').last,
+                                  git: vm.gitInfoForRoot(r),
+                                ),
+                            ],
+                            onUnstageFile: vm.unstageFile,
+                            onDiscardFile: vm.discardFile,
+                            onCommitFile: vm.commitFile,
                             revision: vm.fileTreeRevision,
                             selectedPath: vm.selectedFileInTree,
                             listChildren: vm.listChildren,
@@ -628,6 +815,9 @@ class _CockpitPageState extends State<CockpitPage> {
                             onTapFile: vm.openFile, // clique único = preview
                             onSelectFile:
                                 vm.selectFileInTree, // atualiza highlight
+                            onClearSelection: vm.clearFileSelection,
+                            revealPath: vm.treeRevealPath,
+                            revealGen: vm.treeRevealGen,
                             onOpenDiff: (path) =>
                                 vm.openDiff(path, isPreview: false),
                             onTapDiff: vm.openDiff, // clique único = preview
@@ -643,6 +833,7 @@ class _CockpitPageState extends State<CockpitPage> {
                                 : vm.createFileIn(parentDir, name),
                             onRename: vm.renamePath,
                             onDelete: vm.deletePath,
+                            onMove: vm.movePath,
                             searchPanel: vm.selectedProject == null
                                 ? null
                                 : ContentSearchPanel(
@@ -652,6 +843,12 @@ class _CockpitPageState extends State<CockpitPage> {
                                     focusSignal: _searchFocusSignal,
                                   ),
                             searchFocusSignal: _searchFocusSignal,
+                            databasePanel: vm.selectedProject == null
+                                ? null
+                                : DbPanel(
+                                    workspaceId: vm.selectedProject!.id,
+                                    workspaceRoot: vm.selectedProject!.path,
+                                  ),
                             tasksPanel: vm.selectedProject == null
                                 ? null
                                 : TasksPanel(
@@ -898,9 +1095,8 @@ class _LspStatusBarState extends State<_LspStatusBar> {
                     style: context.typo.label.copyWith(color: colors.text2),
                   ),
                 ),
-                Tooltip(
-                  tooltip: (context) =>
-                      const TooltipContainer(child: Text('Restart server')),
+                AppTooltip(
+                  message: 'Restart server',
                   child: HoverTap(
                     borderRadius: BorderRadius.circular(6),
                     onTap: _restarting ? () {} : () => _restart(vm),
@@ -920,3 +1116,5 @@ class _LspStatusBarState extends State<_LspStatusBar> {
     );
   }
 }
+
+/// Ações do menu de contexto do cabeçalho de uma root (multi-root).

@@ -66,6 +66,7 @@ import { roomIdFor } from "./rooms.js";
 import { registerAgentTools } from "./session/tools.js";
 import { formatPeerInventory } from "./session/peer_inventory.js";
 import { MeshNode } from "./session/mesh_node.js";
+import { MeshRegistrationError, isLogicalAgentId } from "./session/mesh_protocol.js";
 import {
   handleSessionCompact,
   handleModelSet,
@@ -218,13 +219,15 @@ let _currentModel: string | undefined = undefined;  // last-known model name
 let _currentThinking: ThinkingLevel | undefined = undefined;  // last-known thinking level
 
 // ── Agent-network session (plano 19) ──────────────────────────────────────────
-// MeshNode owns both the local UDS mesh (SessionPeer) and the optional
-// cross-PC relay bridge (BrokerRemote + PiForwardClient). The bridge is
-// attached via `_meshNode.attachBridge()` once the relay WS is up and this
-// Pi is the leader; MeshNode re-attaches it across UDS failovers.
+// MeshNode owns the local UDS mesh. Its optional cross-PC bridge remains a
+// generic capability, but this Pi composition does not attach it until
+// distributed logical ownership exists.
 let _meshNode: MeshNode | null = null;
 let _sessionName: string | null = null;
 let _sessionPeerCount = 0;
+let _logicalAgentId: string | null = null;
+let _meshDisabledReason: string | null = null;
+let _meshDisabledNotified = false;
 // Set true by the `session_shutdown` handler. The daemon auto-init defers the
 // connect (`setTimeout(_cmdRoot, 0)`) and connecting is async, so a shutdown can
 // land WHILE this instance's `_cmdRoot` is still mid-connect (`_meshNode` not
@@ -241,6 +244,56 @@ let _disposed = false;
 // remote-pi for ANY session whose local config has auto_start_relay (default
 // true) — interactive AND daemon — instead of only REMOTE_PI_DAEMON=1.
 let _autoInited = false;
+
+function _captureLogicalAgentId(
+  ctx: unknown,
+  fallback?: string,
+  replaceCurrent = false,
+): void {
+  let sessionId: unknown;
+  try {
+    sessionId = (ctx as { sessionManager?: { getSessionId?: () => unknown } })
+      .sessionManager?.getSessionId?.();
+  } catch {
+    sessionId = undefined;
+  }
+
+  const nextId = isLogicalAgentId(sessionId)
+    ? `pi-session:${sessionId}`
+    : fallback;
+  if (isLogicalAgentId(nextId)) {
+    if (replaceCurrent || _logicalAgentId === null) {
+      const changed = _logicalAgentId !== nextId;
+      _logicalAgentId = nextId;
+      if (changed) {
+        _meshDisabledReason = null;
+        _meshDisabledNotified = false;
+      }
+    }
+    return;
+  }
+
+  if (replaceCurrent) {
+    _logicalAgentId = null;
+    _meshDisabledReason = "current Pi session has no stable session ID";
+    _meshDisabledNotified = false;
+  }
+}
+
+function _notifyMeshDisabled(ctx: Pick<ExtensionContext, "ui">): void {
+  if (!_meshDisabledReason || _meshDisabledNotified) return;
+  _meshDisabledNotified = true;
+  ctx.ui.notify(
+    `[remote-pi] Local agent mesh disabled: ${_meshDisabledReason} ` +
+      "Close the owning Pi process, then run /remote-pi to retry. Mobile control remains available.",
+    "error",
+  );
+}
+
+function _disableMesh(ctx: Pick<ExtensionContext, "ui">, reason: string): void {
+  _meshDisabledReason ??= reason;
+  _notifyMeshDisabled(ctx);
+}
 
 // Cached state of global pairings (`peers.json`). Pairing is per-machine, so a
 // device paired in any Pi process is paired everywhere. Refreshed on boot,
@@ -686,20 +739,6 @@ async function _deliverImageUserMessage(
 // ── Cross-PC mesh wiring (plan/25 Wave B/C) ───────────────────────────────────
 
 /**
- * Hand the live relay to MeshNode so it can bring up the cross-PC bridge
- * (BrokerRemote + sibling discovery) — but only when this Pi is the leader
- * (broker host). MeshNode is idempotent + re-attaches across UDS failovers,
- * so this is safe to call from `_cmdStart`, relay reconnect, or SelfRevoke.
- * No-op until the relay WS + cached identity are both present.
- */
-function _attachBridgeIfReady(): void {
-  if (!_meshNode || !_relay || !_relayUrl || !_cachedEd25519) return;
-  void _meshNode
-    .attachBridge({ relay: _relay, relayUrl: _relayUrl, keypair: _cachedEd25519 })
-    .catch(() => { /* best-effort — UDS mesh works regardless */ });
-}
-
-/**
  * Prefer an explicit ctx, then the always-fresh session_start ctx, then the
  * last command ctx. Relay/async paths must not rely on `_lastCtx` alone —
  * the SDK marks captured command ctxs stale after session replacement.
@@ -804,6 +843,12 @@ let _lastConsumedSteerText: string | null = null;
 
 type AndroidQueuedItem = QueuedMessageItem & { editable: true };
 let _queuedItems: AndroidQueuedItem[] = [];
+
+type MeshEnvelope = { id: string; from: string; re: string | null; body: unknown };
+let _pendingMeshMessages: MeshEnvelope[] = [];
+let _agentRunActive = false;
+let _agentRunGeneration = 0;
+let _meshDrainScheduled = false;
 
 function _queuedStateMessage(): ServerMessage {
   const first = _queuedItems[0];
@@ -920,6 +965,7 @@ function _maybeDrainQueuedItem(): void {
  */
 export async function _connectForTest(ctx: unknown): Promise<void> {
   const real = ctx as Parameters<typeof _cmdJoin>[0];
+  _captureLogicalAgentId(real, "pi-session:test-runtime");
   await _cmdJoin(real);
   await _cmdStart(real);
 }
@@ -940,15 +986,16 @@ export function _resetAutoInitedForTest(): void { _autoInited = false; }
 
 /** Test-only: true when this instance holds a live local-mesh node. */
 export function _hasMeshNodeForTest(): boolean { return _meshNode !== null; }
+export function _hasMeshBridgeForTest(): boolean { return _meshNode?.hasBridge() ?? false; }
+export function _getLogicalAgentIdForTest(): string | null { return _logicalAgentId; }
+export function _getMeshDisabledReasonForTest(): string | null { return _meshDisabledReason; }
 
 /** Test-only: the effective (possibly `#N`-suffixed) name the cwd-lock reserved. */
 export function _getLockedNameForTest(): string | null { return _lockedName; }
 
 /** Test-only: release + clear the cwd lock (the lock normally survives stop). */
 export function _resetCwdLockForTest(): void {
-  try { _cwdLock?.release(); } catch { /* ignored */ }
-  _cwdLock = null;
-  _lockedName = null;
+  _releaseCwdLock();
 }
 
 /**
@@ -1043,10 +1090,7 @@ let _cachedEd25519: Ed25519Keypair | null = null;
 // in _goIdle when the relay is torn down.
 let _selfRevoke: SelfRevoke | null = null;
 
-// Per-cwd lock acquired by the first `/remote-pi` invocation in this
-// process. Holds the UDS socket open until the process exits (OS auto-
-// releases on crash too). Stays held across `/remote-pi stop` cycles —
-// only released when the Node process itself dies.
+// Per-cwd/name lock held while this runtime owns a mesh registration.
 let _cwdLock: AcquiredLock | null = null;
 // Effective mesh name this instance locked. Equals the configured/derived name,
 // OR a `#N`-suffixed variant when another agent already holds that (cwd, name)
@@ -1054,6 +1098,12 @@ let _cwdLock: AcquiredLock | null = null;
 // registers under this name; the broker confirms it (and may bump it again under
 // a live race). Null until the lock is acquired.
 let _lockedName: string | null = null;
+
+function _releaseCwdLock(): void {
+  try { _cwdLock?.release(); } catch { /* best-effort */ }
+  _cwdLock = null;
+  _lockedName = null;
+}
 
 // ── Session sync limit (mirror cache cap) ─────────────────────────────────────
 //
@@ -1350,9 +1400,6 @@ async function _attemptReconnect(): Promise<void> {
   relay.on("close", _onRelayClose);
   _stopAutoListener = _installAutoListener(relay);
 
-  // Plan/25 Wave B/C: relay is back; bring cross-PC routing back online.
-  _attachBridgeIfReady();
-
   // _state stays "started"; peer reconnect (if previously paired) flows
   // through _installAutoListener → _findKnownPeer → _promoteToPaired
   // automatically when the app sends any inner.
@@ -1459,9 +1506,9 @@ export async function _handleControl(cmd: string): Promise<void> {
 /**
  * Rename the agent LIVE (plan/38/41), without restarting the process or losing
  * the SDK session/conversation. Touches two layers:
- *   1. **Broker (mesh)**: `MeshNode.rename` does a soft leave+rejoin → new
- *      address `<cwd>@<newName>` (broker may add `#N` on a same-(cwd,name)
- *      collision — we use the assigned result).
+ *   1. **Broker (mesh)**: `MeshNode.rename` atomically changes the routing
+ *      address without releasing logical ownership. The broker may add `#N`
+ *      on a same-(cwd,name) collision.
  *   2. **Relay room (App↔Pi)**: the room is keyed by `(cwd, name)`, so the new
  *      name = a new room. We cycle the relay (`_goIdle` → `_cmdStart`) so the
  *      room follows; the app re-keys the conversation onto the new tile (the
@@ -1474,27 +1521,26 @@ async function _renameAgent(newName: string): Promise<void> {
   if (!newName) return;  // empty rename → no-op
   const ctx = _controlCtx();
   const cwd = process.cwd();
-  saveLocalConfig(cwd, { agent_name: newName });
 
   if (!_meshNode) {
-    // Not on the mesh yet — config persisted; applies on the next join.
+    saveLocalConfig(cwd, { agent_name: newName });
     return;
   }
 
-  // Relay room is derived from the name → cycle it so it follows. Tear down
-  // first (also detaches the bridge) so the broker re-register below starts
-  // clean; bring it back up after with the new name.
-  const wasStarted = _getState() !== "idle";
-  if (wasStarted) _goIdle("peer_stop");
-
-  let assigned = newName;
+  let assigned: string;
   try {
-    assigned = await _meshNode.rename(newName);  // broker soft rejoin
+    assigned = await _meshNode.rename(newName);
   } catch (err) {
     ctx.ui.notify(`[remote-pi] rename failed: ${String(err)}`, "error");
+    return;
   }
 
-  if (wasStarted && !_disposed) await _cmdStart(ctx);  // relay back up → roomIdFor(cwd, assigned)
+  saveLocalConfig(cwd, { agent_name: newName });
+  const wasStarted = _getState() !== "idle";
+  if (wasStarted) {
+    _goIdle("peer_stop");
+    if (!_disposed) await _cmdStart(ctx);
+  }
 
   _pi?.sendMessage({
     customType: "remote-pi:name-assigned",
@@ -1904,6 +1950,11 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     });
   });
 
+  pi.on("agent_start", () => {
+    _agentRunActive = true;
+    _agentRunGeneration += 1;
+  });
+
   pi.on("message_start", (event) => {
     const message = event?.message as BufferMsg | undefined;
     if (!_anyPeerActive() || message?.role !== "user") return;
@@ -1988,6 +2039,18 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     _flushPendingReceivedImagePreviews();
     _lastConsumedSteerText = null;
     _maybeDrainQueuedItem();
+
+    // agent_end listeners finish before pi-agent-core clears its active run.
+    // Defer mesh delivery to the next event-loop turn so triggerTurn cannot
+    // collide with the prompt that emitted this event. A queued continuation
+    // may start first; its generation keeps the older timer from clearing the
+    // new run's busy flag.
+    const endedGeneration = _agentRunGeneration;
+    setTimeout(() => {
+      if (_agentRunGeneration !== endedGeneration) return;
+      _agentRunActive = false;
+      _scheduleMeshMessageDrain();
+    }, 0);
   });
 
   // plan/34: the broker no longer gates delivery on busy state, so we no
@@ -2058,6 +2121,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
   // bound to the current session.
   pi.on("session_start", (_event, ctx) => {
     _lastEventCtx = ctx;
+    _captureLogicalAgentId(ctx, undefined, true);
     // Rearm a reused-but-disposed instance. The session_shutdown teardown (below)
     // sets _disposed=true assuming the host re-evaluates THIS module fresh for the
     // replacement session, yielding a new instance with _disposed=false. Some hosts
@@ -2155,6 +2219,9 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     // (issue #55). session_start re-binds `_lastEventCtx` for the new session.
     _lastCtx = null;
     _lastEventCtx = null;
+    _logicalAgentId = null;
+    _meshDisabledReason = null;
+    _meshDisabledNotified = false;
     if (_meshNode) {
       try { await _meshNode.close(); } catch { /* best-effort */ }
       _meshNode = null;
@@ -2164,11 +2231,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     // No bye reason: the process keeps running and the fresh instance re-joins
     // the SAME relay room, so an explicit offline→online flap would be wrong.
     if (_state !== "idle") _goIdle();
-    if (_cwdLock) {
-      try { _cwdLock.release(); } catch { /* best-effort */ }
-      _cwdLock = null;
-      _lockedName = null;
-    }
+    _releaseCwdLock();
   });
 
   // ── Commands ──────────────────────────────────────────────────────────────
@@ -2206,7 +2269,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
     handler: async (args, ctx) => {
       _lastCtx = ctx;
       const sub = args.trim();
-      if      (sub === "")                       { await _cmdRoot(ctx); }
+      if      (sub === "")                       { await _cmdRoot(ctx, true); }
       else if (sub === "setup")                  { await _cmdSetup(ctx); }
       else if (sub === "status")                 { _cmdStatus(ctx); }
       else if (sub === "stop")                   { await _cmdStop(ctx); }
@@ -2227,7 +2290,7 @@ const extension: ExtensionFactory = (pi: ExtensionAPI): void => {
       else if (sub === "cron" || sub.startsWith("cron ")) { await _cmdCron(sub.slice("cron".length).trim(), ctx); }
       else if (sub === "install")                { _cmdInstall(ctx, { linkCli: true }); }
       else if (sub === "uninstall")              { _cmdUninstall(ctx, { linkCli: true }); }
-      else                                       { await _cmdRoot(ctx); }
+      else                                       { await _cmdRoot(ctx, true); }
     },
   });
 
@@ -2362,14 +2425,17 @@ async function _cmdPeers(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
  * `/remote-pi` is intentionally the only command users need day-to-day:
  * idempotent connect + status display.
  */
-async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void> {
+async function _cmdRoot(
+  ctx: Pick<ExtensionContext, "ui" | "cwd">,
+  allowExplicitMeshRetry = false,
+): Promise<void> {
   if (_cmdRootInFlight) {
     await _cmdRootInFlight;
     _cmdStatus(ctx);
     return;
   }
 
-  const run = _cmdRootInner(ctx);
+  const run = _cmdRootInner(ctx, allowExplicitMeshRetry);
   _cmdRootInFlight = run;
   try {
     await run;
@@ -2378,7 +2444,15 @@ async function _cmdRoot(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
   }
 }
 
-async function _cmdRootInner(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void> {
+async function _cmdRootInner(
+  ctx: Pick<ExtensionContext, "ui" | "cwd">,
+  allowExplicitMeshRetry: boolean,
+): Promise<void> {
+  _captureLogicalAgentId(ctx);
+  if (allowExplicitMeshRetry && _logicalAgentId) {
+    _meshDisabledReason = null;
+    _meshDisabledNotified = false;
+  }
   // This instance was torn down (session replacement) before its deferred
   // auto-init ran — don't connect, or we'd resurrect a ghost the broker can't
   // reach. The replacement instance (fresh module) drives the live connect.
@@ -2686,11 +2760,6 @@ async function _cmdStart(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<voi
     });
     _selfRevoke.start();
   }
-
-  // Plan/25 Wave B/C: bring up cross-PC routing if local broker is ready.
-  // No-op when we're a follower (the bridge needs the local Broker instance
-  // the leader hosts). Best-effort; failures don't surface.
-  _attachBridgeIfReady();
 
   _emitRelayState();  // → connected
   ctx.ui.notify(`[remote-pi] state: started (peer=${myShort}) — Connected to relay ${relayUrl}`, "info");
@@ -3585,12 +3654,59 @@ function _wakeAgent(
  * Wake: we inject a CUSTOM message (role:"custom"), not a user message. The
  * SDK's `convertToLlm` maps custom → a user-role LLM message, so the agent
  * still sees + replies to it, but `message_end` does NOT buffer role:"custom",
- * so it never replays as `user_input` on session_sync. `triggerTurn` runs the
- * turn; `id` lets the LLM echo it via `agent_send(..., re=<id>)`.
+ * so it never replays as `user_input` on session_sync. Mesh messages are held
+ * until the current `agent_end` listeners finish, then appended as one batch
+ * before a single turn starts. This avoids calling `prompt()` during the gap
+ * where Pi has stopped streaming but the current agent run is still active.
+ * `id` lets the LLM echo it via
+ * `agent_send(..., re=<id>)`.
  */
-function _deliverMeshMessageToAgent(
-  env: { id: string; from: string; re: string | null; body: unknown },
-): void {
+function _meshMessageForAgent(env: MeshEnvelope) {
+  const bodyText = typeof env.body === "string" ? env.body : JSON.stringify(env.body);
+  const header = `[agent-network] message from "${env.from}" (id=${env.id}${env.re ? `, re=${env.re}` : ""}):`;
+  const footer = env.re
+    ? "(This is a reply to a previous message of yours.)"
+    : `(If a reply is expected, call agent_send with to="${env.from}" and re="${env.id}".)`;
+  return {
+    customType: "remote-pi:mesh-message",
+    content: `${header}\n${bodyText}\n\n${footer}`,
+    display: true,
+  };
+}
+
+function _scheduleMeshMessageDrain(): void {
+  if (_meshDrainScheduled || _pendingMeshMessages.length === 0) return;
+  _meshDrainScheduled = true;
+  queueMicrotask(() => {
+    _meshDrainScheduled = false;
+    const pi = _pi;
+    if (_agentRunActive || !pi || _pendingMeshMessages.length === 0) return;
+
+    const batch = _pendingMeshMessages.splice(0);
+    let delivered = 0;
+    _agentRunActive = true;
+    try {
+      batch.forEach((env, index) => {
+        const isLast = index === batch.length - 1;
+        pi.sendMessage(
+          _meshMessageForAgent(env),
+          isLast
+            ? { triggerTurn: true, deliverAs: "followUp" }
+            : { triggerTurn: false },
+        );
+        delivered += 1;
+      });
+    } catch (err) {
+      _agentRunActive = false;
+      _pendingMeshMessages = [...batch.slice(delivered), ..._pendingMeshMessages];
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error(`[remote-pi] queued mesh delivery failed: ${detail}`);
+      _safeNotify(`[remote-pi] failed to process queued mesh messages: ${detail}`, "error");
+    }
+  });
+}
+
+function _deliverMeshMessageToAgent(env: MeshEnvelope): void {
   const bodyText = typeof env.body === "string" ? env.body : JSON.stringify(env.body);
   const toolCallId = `mesh_${env.id}`;
   _broadcastToActive({
@@ -3603,25 +3719,17 @@ function _deliverMeshMessageToAgent(
   });
   _broadcastToActive({ type: "tool_result", tool_call_id: toolCallId, result: { from: env.from, message: bodyText } });
 
-  const label = `agent-network message from "${env.from}"`;
   if (!_pi) {
-    console.error(`[remote-pi] ${label}: agent session not bound yet — message dropped`);
+    console.error(`[remote-pi] agent-network message from "${env.from}": agent session not bound yet — message dropped`);
     return;
   }
-  const header = `[agent-network] message from "${env.from}" (id=${env.id}${env.re ? `, re=${env.re}` : ""}):`;
-  const footer = env.re
-    ? "(This is a reply to a previous message of yours.)"
-    : `(If a reply is expected, call agent_send with to="${env.from}" and re="${env.id}".)`;
-  try {
-    _pi.sendMessage(
-      { customType: "remote-pi:mesh-message", content: `${header}\n${bodyText}\n\n${footer}`, display: true },
-      { triggerTurn: true },
-    );
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    console.error(`[remote-pi] ${label}: agent rejected incoming message: ${detail}`);
-    _safeNotify(`[remote-pi] failed to process incoming message: ${detail}`, "error");
-  }
+  _pendingMeshMessages.push(env);
+  _scheduleMeshMessageDrain();
+}
+
+/** Test-only entry point for verifying mesh-to-agent delivery semantics. */
+export function _deliverMeshMessageToAgentForTest(env: MeshEnvelope): void {
+  _deliverMeshMessageToAgent(env);
 }
 
 /**
@@ -3653,18 +3761,28 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
 
   const sock = sessionSockPath(sessionName);
   const audit = sessionAuditPath(sessionName);
-  // Forward the cwd so the broker keys this peer by (cwd, name): a same-folder
-  // same-name reincarnation (switch_session re-eval, app restart) takes over the
-  // name instead of registering behind a mute `name#N` ghost. Canonicalize via
-  // realpath so symlinked cwds map to one identity (matches roomIdForCwd).
+  // Forward the cwd so the broker can scope the human-readable routing address.
+  // Logical ownership is enforced separately by the canonical Pi session ID.
+  // Canonicalize symlinked cwd values so equivalent paths share one address scope.
   let canonCwd = cwd;
   try { canonCwd = realpathSync(cwd); } catch { /* cwd missing — use raw path */ }
+  if (!_logicalAgentId) {
+    _disableMesh(ctx, "current Pi session has no stable session ID");
+    _releaseCwdLock();
+    return;
+  }
+  if (_meshDisabledReason) {
+    _notifyMeshDisabled(ctx);
+    _releaseCwdLock();
+    return;
+  }
+
   const peer = new MeshNode({
     sockPath: sock,
     name: agentName,
+    logicalAgentId: _logicalAgentId,
     cwd: canonCwd,
     auditPath: audit,
-    takeoverExisting: process.env["REMOTE_PI_DAEMON"] === "1",
   });
 
   peer.onMessage((env) => {
@@ -3765,11 +3883,14 @@ async function _cmdJoin(ctx: Pick<ExtensionContext, "ui" | "cwd">): Promise<void
       "info",
     );
     _refreshFooter(ctx);
-    // Plan/25 Wave B/C: try to bring up cross-PC routing now that the
-    // local broker exists. No-op if the relay isn't up yet (will fire
-    // again from `_cmdStart`).
-    _attachBridgeIfReady();
   } catch (err) {
+    try { await peer.close(); } catch { /* best-effort */ }
+    if (err instanceof MeshRegistrationError) {
+      const owner = err.ownerAddress ? ` Owner: ${err.ownerAddress}.` : "";
+      _disableMesh(ctx, `${err.message}${owner}`);
+      _releaseCwdLock();
+      return;
+    }
     ctx.ui.notify(`[remote-pi] join failed: ${String(err)}`, "error");
   }
 }
@@ -4703,6 +4824,25 @@ function _agentNetworkSkillPath(): string | null {
   return existsSync(skill) ? skill : null;
 }
 
+export function _createMcpLogicalAgentId(): string {
+  return `mcp-session:${randomUUID()}`;
+}
+
+export function _buildMcpServerConfig(
+  meshServerPath: string,
+  logicalAgentId: string,
+): { mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> } {
+  return {
+    mcpServers: {
+      "remote-pi-mesh": {
+        command: process.execPath,
+        args: [meshServerPath],
+        env: { REMOTE_PI_MCP_LOGICAL_AGENT_ID: logicalAgentId },
+      },
+    },
+  };
+}
+
 async function _cmdClaudeCli(args: string[]): Promise<void> {
   // Contract: `remote-pi claude [cwd] [claude-flags...]`. The optional cwd is
   // ONLY the leading positional (first token, not a flag); everything after it
@@ -4769,11 +4909,11 @@ async function _cmdClaudeCli(args: string[]): Promise<void> {
   // as the right agent without leaking that path to any other session.
   // Unique per pid so concurrent `remote-pi claude` launches don't collide.
   const mcpConfigPath = join(tmpdir(), `remote-pi-mesh-mcp-${process.pid}.json`);
-  writeFileSync(mcpConfigPath, JSON.stringify({
-    mcpServers: {
-      [SERVER_NAME]: { command: process.execPath, args: [meshServerPath] },
-    },
-  }));
+  const mcpLogicalAgentId = _createMcpLogicalAgentId();
+  writeFileSync(
+    mcpConfigPath,
+    JSON.stringify(_buildMcpServerConfig(meshServerPath, mcpLogicalAgentId)),
+  );
 
   // Inject the agent-network protocol as a system prompt instead of deploying a
   // skill file into ~/.claude. Anyone running `remote-pi claude` is here to use

@@ -3,6 +3,16 @@ import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { type Envelope, parse, serialize, uuidv7, EnvelopeError } from "./envelope.js";
 import { sanitizeSegment } from "./local_config.js";
+import {
+  MESH_PROTOCOL_VERSION,
+  isLogicalAgentId,
+  type MeshRegistrationErrorCode,
+  type RegisterAck,
+  type RegisterErrorFrame,
+  type RegisterRequest,
+  type RenameAck,
+  type RenameRequest,
+} from "./mesh_protocol.js";
 
 /**
  * Structured view of one mesh peer (plan/38). The `address` is the canonical
@@ -120,6 +130,8 @@ export interface RemoteRouter {
 export type RemoteInjectStatus = "received" | "denied";
 
 interface PeerConn {
+  /** Opaque logical runtime identity. Empty until registration succeeds. */
+  logicalAgentId: string;
   /** Clean leaf name (may carry a `#N` on a same-(cwd,name) collision). */
   name: string;
   /** Working directory the peer registered with — the second half of the
@@ -130,6 +142,7 @@ interface PeerConn {
   address: string;
   socket: Socket;
   buf: string;
+  registrationRejected: boolean;
 }
 
 const BROKER_NAME = "broker";
@@ -140,28 +153,6 @@ interface AckBody {
   type: "ack";
   status: "received" | "denied";
   target: string;
-}
-
-interface RegisterMsg {
-  type: "register";
-  name: string;
-  /** Optional working directory — enables (cwd,name) take-over (see
-   *  `_handleRegister`). Absent → legacy `#N`-on-collision behavior. */
-  cwd?: string;
-  /** Replace an existing same-(cwd,name) peer instead of suffixing `#N`.
-   *  Used by stable identities such as supervised daemons and session
-   *  replacement, where a second registration is the same logical agent. */
-  takeover?: boolean;
-}
-
-interface RegisterAck {
-  type: "register_ack";
-  /** Canonical address (plan/38). New clients route by this. */
-  address_assigned: string;
-  /** Clean leaf name actually assigned (carries `#N` on a same-(cwd,name)
-   *  collision). New clients use it for display; for a legacy peer (no cwd)
-   *  it equals `address_assigned`. */
-  name_assigned: string;
 }
 
 interface SystemBody {
@@ -178,6 +169,7 @@ interface SystemBody {
 
 export class Broker {
   private readonly peers = new Map<string, PeerConn>();
+  private readonly peersByLogicalAgentId = new Map<string, PeerConn>();
   private readonly auditPath?: string;
   private readonly onRouted?: BrokerOptions["onRouted"];
   private readonly server: Server;
@@ -238,13 +230,22 @@ export class Broker {
   async close(): Promise<void> {
     for (const p of this.peers.values()) p.socket.destroy();
     this.peers.clear();
+    this.peersByLogicalAgentId.clear();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
 
   // ── connection lifecycle ──────────────────────────────────────────────────
 
   private _handleConnection(socket: Socket): void {
-    const conn: PeerConn = { name: "", cwd: "", address: "", socket, buf: "" };
+    const conn: PeerConn = {
+      logicalAgentId: "",
+      name: "",
+      cwd: "",
+      address: "",
+      socket,
+      buf: "",
+      registrationRejected: false,
+    };
     socket.setEncoding("utf8");
     socket.on("data", (chunk: string) => this._onData(conn, chunk));
     socket.on("close", () => this._onClose(conn));
@@ -258,6 +259,10 @@ export class Broker {
       const line = conn.buf.slice(0, nl);
       conn.buf = conn.buf.slice(nl + 1);
       if (!line) continue;
+      if (conn.registrationRejected) {
+        conn.buf = "";
+        break;
+      }
       void this._handleLine(conn, line);
     }
   }
@@ -271,6 +276,15 @@ export class Broker {
       this._handleRegister(conn, line);
       return;
     }
+    // Registered peers may rename without releasing logical ownership.
+    try {
+      const control = JSON.parse(line) as { type?: unknown };
+      if (control?.type === "rename") {
+        this._handleRename(conn, control as Partial<RenameRequest>);
+        return;
+      }
+    } catch { /* regular envelope parser below handles malformed input */ }
+
     // Already registered — must be a regular envelope.
     let env: Envelope;
     try {
@@ -286,46 +300,77 @@ export class Broker {
   }
 
   private _handleRegister(conn: PeerConn, line: string): void {
-    let req: RegisterMsg;
+    let req: Partial<RegisterRequest>;
     try {
       const parsed = JSON.parse(line) as unknown;
-      if (
-        !parsed ||
-        typeof parsed !== "object" ||
-        (parsed as { type?: unknown }).type !== "register" ||
-        typeof (parsed as { name?: unknown }).name !== "string"
-      ) {
-        conn.socket.destroy();
+      if (!parsed || typeof parsed !== "object" || (parsed as { type?: unknown }).type !== "register") {
+        this._rejectRegistration(conn, "unsupported_protocol", "expected protocol v2 register frame");
         return;
       }
-      req = parsed as RegisterMsg;
+      req = parsed as Partial<RegisterRequest>;
     } catch {
-      conn.socket.destroy();
+      this._rejectRegistration(conn, "unsupported_protocol", "expected protocol v2 register frame");
       return;
     }
 
-    // (cwd, name) identity (plan/38). The cwd is the first-class axis: the
-    // address embeds it, so two same-named agents in DIFFERENT folders get
-    // distinct addresses and never collide. Legacy peers (no cwd) keep the old
-    // global-name behavior. New peers can opt into exact-address takeover for
-    // same-folder reincarnations such as daemon restarts.
-    conn.cwd = typeof req.cwd === "string" ? req.cwd : "";
+    if (req.protocol_version !== MESH_PROTOCOL_VERSION) {
+      this._rejectRegistration(conn, "unsupported_protocol", `mesh protocol v${MESH_PROTOCOL_VERSION} is required`);
+      return;
+    }
+    if (!isLogicalAgentId(req.logical_agent_id)) {
+      this._rejectRegistration(conn, "invalid_logical_agent_id", "logical_agent_id must be a non-empty string");
+      return;
+    }
+    if (typeof req.name !== "string") {
+      this._rejectRegistration(conn, "invalid_registration", "name must be a string");
+      return;
+    }
 
-    const { name, address } = this._identityForRegister(conn.cwd, req.name, req.takeover === true);
+    const owner = this.peersByLogicalAgentId.get(req.logical_agent_id);
+    if (owner) {
+      this._rejectRegistration(
+        conn,
+        "logical_agent_already_connected",
+        "This logical agent already has an active mesh connection.",
+        owner.address,
+      );
+      return;
+    }
+
+    conn.cwd = typeof req.cwd === "string" ? req.cwd : "";
+    const { name, address } = this._identityForRegister(conn.cwd, req.name);
+    conn.logicalAgentId = req.logical_agent_id;
     conn.name = name;
     conn.address = address;
     this.peers.set(address, conn);
+    this.peersByLogicalAgentId.set(conn.logicalAgentId, conn);
 
-    // `name_assigned` doubles as the compat alias: for a legacy peer it equals
-    // `address_assigned` (cwd empty → address == name), so old clients that read
-    // `name_assigned` still get a routable identity.
-    const ack: RegisterAck = { type: "register_ack", address_assigned: address, name_assigned: name };
-    try {
-      conn.socket.write(JSON.stringify(ack) + "\n");
-    } catch { /* peer hung up */ }
+    const ack: RegisterAck = {
+      type: "register_ack",
+      protocol_version: MESH_PROTOCOL_VERSION,
+      address_assigned: address,
+      name_assigned: name,
+    };
+    try { conn.socket.write(JSON.stringify(ack) + "\n"); } catch { /* peer hung up */ }
 
-    // Notify others (peer_joined broadcast). The field carries the ADDRESS.
     this._broadcastSystem({ type: "peer_joined", name: address, address }, address);
+  }
+
+  private _rejectRegistration(
+    conn: PeerConn,
+    code: MeshRegistrationErrorCode,
+    message: string,
+    ownerAddress?: string,
+  ): void {
+    conn.registrationRejected = true;
+    const frame: RegisterErrorFrame = {
+      type: "register_error",
+      protocol_version: MESH_PROTOCOL_VERSION,
+      code,
+      message,
+      ...(ownerAddress !== undefined ? { owner_address: ownerAddress } : {}),
+    };
+    try { conn.socket.end(JSON.stringify(frame) + "\n"); } catch { conn.socket.destroy(); }
   }
 
   /**
@@ -336,6 +381,38 @@ export class Broker {
    * querying the roster from the shell never perturbs the mesh. Returns false
    * (not a probe) so the caller falls through to the register handshake.
    */
+  private _handleRename(conn: PeerConn, req: Partial<RenameRequest>): void {
+    if (req.protocol_version !== MESH_PROTOCOL_VERSION || typeof req.name !== "string") {
+      return;
+    }
+
+    const oldAddress = conn.address;
+    this.peers.delete(oldAddress);
+    let next: { name: string; address: string };
+    try {
+      next = this._identityForRegister(conn.cwd, req.name);
+    } catch (error) {
+      this.peers.set(oldAddress, conn);
+      throw error;
+    }
+
+    conn.name = next.name;
+    conn.address = next.address;
+    this.peers.set(next.address, conn);
+
+    const ack: RenameAck = {
+      type: "rename_ack",
+      protocol_version: MESH_PROTOCOL_VERSION,
+      address_assigned: next.address,
+      name_assigned: next.name,
+    };
+    try { conn.socket.write(JSON.stringify(ack) + "\n"); } catch { /* peer hung up */ }
+    if (oldAddress !== next.address) {
+      this._broadcastSystem({ type: "peer_left", name: oldAddress, address: oldAddress }, next.address);
+      this._broadcastSystem({ type: "peer_joined", name: next.address, address: next.address }, next.address);
+    }
+  }
+
   private _tryObserverProbe(conn: PeerConn, line: string): boolean {
     let parsed: { type?: unknown };
     try {
@@ -395,13 +472,9 @@ export class Broker {
    * (matching the cwd-lock's suffix scheme) until the address is free; for a
    * legacy peer (cwd "") the address is the name, preserving global-name `#N`.
    */
-  private _identityForRegister(cwd: string, requested: string, takeover: boolean): { name: string; address: string } {
+  private _identityForRegister(cwd: string, requested: string): { name: string; address: string } {
     const sanitized = sanitizeMeshName(requested);
     let address = composeAddress({ cwd, name: sanitized });
-    if (takeover && cwd && this.peers.has(address)) {
-      this._dropPeerAt(address);
-      return { name: sanitized, address };
-    }
     if (!this.peers.has(address)) return { name: sanitized, address };
     // Collision: strip any client-provided `#N`, then re-suffix from #2.
     const base = sanitized.replace(/#\d+$/, "");
@@ -413,20 +486,12 @@ export class Broker {
     throw new Error(`name space exhausted for ${base} in ${cwd || "(no cwd)"}`);
   }
 
-  private _dropPeerAt(address: string): void {
-    const existing = this.peers.get(address);
-    if (!existing) return;
-    this.peers.delete(address);
-    // The old socket's close event may arrive after the replacement has been
-    // inserted. Clear its address so it cannot delete the replacement.
-    existing.address = "";
-    try { existing.socket.destroy(); } catch { /* ignored */ }
-  }
-
   private _onClose(conn: PeerConn): void {
-    if (!conn.address) return;
-    if (this.peers.get(conn.address) !== conn) return;
+    if (!conn.address || this.peers.get(conn.address) !== conn) return;
     this.peers.delete(conn.address);
+    if (this.peersByLogicalAgentId.get(conn.logicalAgentId) === conn) {
+      this.peersByLogicalAgentId.delete(conn.logicalAgentId);
+    }
     this._broadcastSystem({ type: "peer_left", name: conn.address, address: conn.address }, conn.address);
   }
 

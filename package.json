@@ -1,0 +1,20 @@
+{
+  "name": "remote-pi-repository",
+  "private": true,
+  "workspaces": [
+    "pi-extension"
+  ],
+  "scripts": {
+    "prepare": "npm run build --workspace pi-extension"
+  },
+  "dependencies": {
+    "@types/node": "25.8.0",
+    "@types/ws": "8.18.1",
+    "typescript": "6.0.3"
+  },
+  "pi": {
+    "extensions": [
+      "./pi-extension/dist"
+    ]
+  }
+}

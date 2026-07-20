@@ -9,7 +9,7 @@ import 'package:cockpit/app/core/utils/login_shell.dart';
 import 'package:cockpit/app/cockpit/domain/contracts/task_runner_gateway.dart';
 import 'package:cockpit/app/cockpit/domain/entities/task_definition.dart';
 import 'package:cockpit/app/cockpit/domain/entities/task_run.dart';
-import 'package:kyroon_pty/kyroon_pty.dart';
+import 'package:cockpit_pty/cockpit_pty.dart';
 
 /// Executor de tasks num PTY nativo (`kyroon_pty`). Roda cada task via **login
 /// shell** (o shell de login do usuário + `-ilc "<cmd>"`, ver [resolveLoginShell])
@@ -237,6 +237,13 @@ class PtyTaskRunner implements TaskRunnerGateway {
       exitCode: code,
     );
     unawaited(task.outSub?.cancel());
+    // Banner visual de fim no terminal do debug tab: pula uma linha e escreve
+    // "finished" pra sinalizar ao usuário que o processo encerrou (o PTY não
+    // emite mais nada depois do exit). Vai antes do close pra ser entregue ao
+    // terminal e persistido no scrollback junto do resto do output.
+    if (!task.out.isClosed) {
+      task.out.add(utf8.encode('\r\n\r\nfinished\r\n'));
+    }
     unawaited(task.out.close());
     _emit(ended);
   }

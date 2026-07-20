@@ -3,13 +3,14 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { setTimeout as wait } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { createConnection } from "node:net";
+import { createConnection, createServer, type Socket } from "node:net";
 import { ipcAddress } from "./ipc.js";
-import { SessionPeer } from "./peer.js";
+import { MeshRegistrationError, SessionPeer } from "./peer.js";
 import type { Envelope } from "./envelope.js";
 import { probeListPeers } from "../index.js";
 import { composeAddress, sanitizeMeshName, type PeerInfo } from "./broker.js";
 import { migrateAgentName } from "./local_config.js";
+import { sessionSockPath } from "./global_config.js";
 
 function tmpSock(): string {
   // Per-test unique IPC address. POSIX → a `.sock` file in a fresh tmpdir;
@@ -19,13 +20,30 @@ function tmpSock(): string {
   return ipcAddress(`e2e-${basename(dir)}`, join(dir, "broker.sock"));
 }
 
+let logicalAgentSequence = 0;
+
+function nextLogicalAgentId(label: string): string {
+  logicalAgentSequence += 1;
+  return `test:${label}:${logicalAgentSequence}`;
+}
+
 async function makePeer(sockPath: string, name: string, auditPath?: string): Promise<SessionPeer> {
-  const peer = new SessionPeer({ sockPath, name, auditPath, defaultTimeoutMs: 3000 });
+  const peer = new SessionPeer({
+    sockPath,
+    name,
+    logicalAgentId: nextLogicalAgentId(name),
+    auditPath,
+    defaultTimeoutMs: 3000,
+  });
   await peer.start();
   return peer;
 }
 
 describe("agent-network e2e", () => {
+  test("protocol v2 uses a socket namespace separate from legacy brokers", () => {
+    expect(sessionSockPath("local")).toMatch(/broker-v2(?:-local|\.sock)/);
+  });
+
   test("1) single agent join — peer alone with itself as leader", async () => {
     const sock = tmpSock();
     const p = await makePeer(sock, "solo");
@@ -382,7 +400,13 @@ describe("ACK protocol (plan/25 Wave 0)", () => {
 
   test("Broker.list_peers surfaces remote peers_detailed with pc (plan/38 Fase 2)", async () => {
     const sock = tmpSock();
-    const orq = new SessionPeer({ sockPath: sock, name: "orq", cwd: "/w/orq", defaultTimeoutMs: 3000 });
+    const orq = new SessionPeer({
+      sockPath: sock,
+      name: "orq",
+      logicalAgentId: nextLogicalAgentId("orq"),
+      cwd: "/w/orq",
+      defaultTimeoutMs: 3000,
+    });
     await orq.start();
     const broker = orq.localBroker()!;
 
@@ -504,6 +528,41 @@ describe("ACK protocol (plan/25 Wave 0)", () => {
 
   // ── `remote-pi peers` observer probe (read-only roster) ─────────────────────
 
+  test("legacy registration without protocol identity fails before joining", async () => {
+    const sock = tmpSock();
+    const owner = await makePeer(sock, "owner");
+
+    const frame = await new Promise<{ type: string; code: string }>((resolve, reject) => {
+      const legacy = createConnection({ path: sock });
+      let buf = "";
+      const timer = setTimeout(() => reject(new Error("legacy rejection timeout")), 2000);
+      legacy.setEncoding("utf8");
+      legacy.on("connect", () => legacy.write(
+        JSON.stringify({ type: "register", name: "legacy" }) + "\n" +
+        JSON.stringify({
+          type: "register",
+          protocol_version: 2,
+          logical_agent_id: "test:pipelined-bypass",
+          name: "bypass",
+        }) + "\n",
+      ));
+      legacy.on("data", (chunk: string) => {
+        buf += chunk;
+        const nl = buf.indexOf("\n");
+        if (nl < 0) return;
+        clearTimeout(timer);
+        legacy.destroy();
+        resolve(JSON.parse(buf.slice(0, nl)) as { type: string; code: string });
+      });
+      legacy.on("error", reject);
+    });
+
+    expect(frame).toMatchObject({ type: "register_error", code: "unsupported_protocol" });
+    const reply = await owner.request("broker", { type: "list_peers" });
+    expect((reply.body as { peers: string[] }).peers).toEqual(["owner"]);
+    await owner.leave();
+  });
+
   test("unregistered list_peers probe returns the roster without joining", async () => {
     const sock = tmpSock();
     const orq = await makePeer(sock, "orq");
@@ -619,7 +678,13 @@ describe("plan/38 — address encoder + name migration (pure)", () => {
 
 describe("plan/38 — (cwd, name) mesh addressing (e2e)", () => {
   async function makePeerCwd(sockPath: string, name: string, cwd: string): Promise<SessionPeer> {
-    const peer = new SessionPeer({ sockPath, name, cwd, defaultTimeoutMs: 3000 });
+    const peer = new SessionPeer({
+      sockPath,
+      name,
+      logicalAgentId: nextLogicalAgentId(name),
+      cwd,
+      defaultTimeoutMs: 3000,
+    });
     await peer.start();
     return peer;
   }
@@ -666,30 +731,75 @@ describe("plan/38 — (cwd, name) mesh addressing (e2e)", () => {
     await a.leave(); await b.leave();
   });
 
-  test("takeoverExisting replaces the same cwd/name instead of creating #2", async () => {
+  test("registration timeout closes the socket and suppresses reconnect", async () => {
     const sock = tmpSock();
-    const first = await makePeerCwd(sock, "backend", "/a/backend");
-    const replacement = new SessionPeer({
+    let registrationSocket: Socket | null = null;
+    const server = createServer((socket) => {
+      socket.on("data", () => { registrationSocket = socket; });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(sock, resolve);
+    });
+
+    const peer = new SessionPeer({
+      sockPath: sock,
+      name: "timeout",
+      logicalAgentId: "test:registration-timeout",
+      registrationTimeoutMs: 30,
+    });
+    await expect(peer.start()).rejects.toThrow("register_ack timeout");
+    await wait(150);
+    expect(registrationSocket).not.toBeNull();
+    expect(registrationSocket!.destroyed).toBe(true);
+    await peer.leave();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  test("duplicate logical identity is rejected before it becomes routable", async () => {
+    const sock = tmpSock();
+    const logicalAgentId = "pi-session:same-session";
+    const first = new SessionPeer({
       sockPath: sock,
       name: "backend",
+      logicalAgentId,
       cwd: "/a/backend",
-      takeoverExisting: true,
       defaultTimeoutMs: 3000,
     });
-    await replacement.start();
+    await first.start();
 
-    expect(replacement.name()).toBe("backend");
-    expect(replacement.address()).toBe("/a/backend@backend");
+    const duplicate = new SessionPeer({
+      sockPath: sock,
+      name: "other-frontend",
+      logicalAgentId,
+      cwd: "/a/backend",
+      defaultTimeoutMs: 3000,
+    });
+    await expect(duplicate.start()).rejects.toMatchObject({
+      name: "MeshRegistrationError",
+      code: "logical_agent_already_connected",
+      ownerAddress: "/a/backend@backend",
+    } satisfies Partial<MeshRegistrationError>);
 
-    const reply = await replacement.request("broker", { type: "list_peers" });
-    const peers = (reply.body as { peers?: string[] }).peers ?? [];
-    expect(peers.filter((p) => p.startsWith("/a/backend@backend"))).toEqual([
-      "/a/backend@backend",
-    ]);
+    await wait(200);
+    const reply = await first.request("broker", { type: "list_peers" });
+    expect((reply.body as { peers?: string[] }).peers).toEqual(["/a/backend@backend"]);
 
-    await expect(first.send("broadcast", { stale: true })).rejects.toThrow("session peer not connected");
+    await duplicate.leave();
     await first.leave();
-    await replacement.leave();
+  });
+
+  test("logical identity can register again after its owner leaves", async () => {
+    const sock = tmpSock();
+    const logicalAgentId = "pi-session:restartable";
+    const first = new SessionPeer({ sockPath: sock, name: "backend", logicalAgentId });
+    await first.start();
+    await first.leave();
+
+    const restarted = new SessionPeer({ sockPath: sock, name: "backend", logicalAgentId });
+    await restarted.start();
+    expect(restarted.name()).toBe("backend");
+    await restarted.leave();
   });
 
   test("list_peers_reply carries peers_detailed ({cwd,name,address})", async () => {

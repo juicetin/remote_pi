@@ -42,10 +42,18 @@ abstract class WorktreeManager {
   /// validação de unicidade. Vazio se não-git/erro.
   Future<WorktreeNamespace> namespace(String repoPath);
 
-  /// Cria uma worktree em `<repoPath>/.pi/remote/worktrees/<name>` numa branch
-  /// **nova** [name] a partir do HEAD atual do repo (decisões 2, 3, 15).
-  /// [name] já deve ter passado pela validação de nome.
-  Future<Result<Worktree, WorktreeOpError>> add(String repoPath, String name);
+  /// Cria uma worktree em `<repoPath>/.cockpit/worktrees/<name>` numa branch
+  /// **nova** [name] (decisões 2, 3, 15), garantindo antes que
+  /// `.cockpit/worktrees/` está no `.gitignore` do repo. A base é o HEAD atual
+  /// do repo, ou [baseRef] quando informado ("Fork Worktree": ramifica da
+  /// branch de outro fork, mas a pasta nasce sempre sob o repo de origem —
+  /// nunca aninhada dentro de outra worktree). [name] já deve ter passado pela
+  /// validação de nome.
+  Future<Result<Worktree, WorktreeOpError>> add(
+    String repoPath,
+    String name, {
+    String? baseRef,
+  });
 
   /// Remove a worktree em [worktreePath] e, se [branch] não for vazio, apaga a
   /// branch (decisão 6 — `git worktree remove` **antes** de `git branch -D`).

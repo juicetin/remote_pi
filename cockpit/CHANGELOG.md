@@ -14,6 +14,115 @@ As versões seguem o `version:` do `pubspec.yaml` (SSOT). O campo `notes` do
   meio da frase).
 -->
 
+## [1.13.0] — 2026-07-19
+
+Novo: browsers visuais de Redis e MongoDB na tab Database — tabela de chaves
+editável e collection browser estilo Compass, com abertura via CLI.
+
+### Added
+- **Redis key table:** clique na conexão abre a tabela key/value/type/ttl —
+  edição inline (valor, TTL e rename de chave), compostos expandem com o valor
+  completo, criação dos 5 tipos, SCAN paginado com busca por pattern.
+- **Mongo collection browser:** collections no painel; documentos como cards
+  JSON com highlight, filter bar JSON, editar/inserir/deletar por `_id`.
+  Extended JSON (`$oid`/`$date`) preservado de ponta a ponta.
+- **CLI `cockpit redis|mongo browse`:** o agente abre a view já filtrada pro
+  humano (`--pattern` / `--filter`), sem expor credenciais.
+- Logos de marca (Redis/MongoDB) nas abas dos browsers.
+
+### Fixed
+- `cockpit mongo` agora devolve ObjectId/Date como extended JSON canônico
+  (antes saía hex/string ambíguos).
+
+## [1.12.0] — 2026-07-19
+
+Novo: acesso a bancos de dados direto no Cockpit — painel de conexões, tab de
+query `.dbq` e a CLI `cockpit db` para os agentes.
+
+### Added
+- **Painel Database:** conexões por workspace (`.cockpit/databases.json`),
+  SQLite detectado automaticamente, senha no cofre do SO. Árvore de schema
+  (tabelas → colunas) e logos de marca por engine.
+- **Tab de query `.dbq`:** editor SQL com highlight + grid de resultado (split
+  arrastável), Run por statement sob o cursor, resultado como tabela ou JSON
+  (copiável), buffers *untitled* (o arquivo nasce só ao salvar).
+- **Engines:** SQLite, Postgres, MySQL e SQL Server (via anakiORM).
+- **CLI `cockpit db list|schema|query|execute|run`** — JSON de uma linha para
+  os agentes; execução no app, credenciais nunca passam pela CLI.
+- **Redis e MongoDB via CLI** (`cockpit redis` / `cockpit mongo`) — acesso do
+  agente sem UI por enquanto.
+
+## [1.11.0] — 2026-07-18
+
+Melhorias na árvore de Files (criação e reveal), no multi-root e na CLI interna.
+
+### Added
+- **New file/folder ciente da seleção:** cria dentro da pasta selecionada, na
+  pasta-mãe do arquivo selecionado, ou na raiz quando nada está selecionado.
+  Clicar numa área vazia da árvore deseleciona.
+- **Revelar na árvore:** selecionar uma tab de arquivo destaca o arquivo no
+  painel Files e expande as pastas-pai até ele.
+- **Copy Absolute/Relative Path** no menu de contexto de cada repo (multi-root).
+
+### Changed
+- **CLI interna (`cockpit`):** nomenclatura alinhada pra *tab* — `list-tabs`,
+  `read-tab`, `$COCKPIT_TAB_ID`. Os antigos `list-panes`/`read-pane`/
+  `$COCKPIT_PANE_ID` seguem como aliases de compatibilidade.
+
+### Fixed
+- **Multi-root:** New file/New folder agora funcionam por repo (antes o botão do
+  header não criava nada num workspace multirepo).
+- **Multi-root:** o chip “N roots · M” contava divergência de upstream como se
+  fosse alteração; agora conta só arquivos modificados.
+
+## [1.10.1] — 2026-07-18
+
+### Fixed
+- **Commit falhava em repositórios com hook de `pre-commit`** que chama
+  `npx`/`node` (ex.: `lint-staged`, `husky`, `simple-git-hooks`): o app roda com
+  um PATH mínimo e o hook não achava o `npx` ("command not found"). O Source
+  Control agora passa o mesmo PATH com `node` do terminal/tasks — o hook resolve.
+
+## [1.10.0] — 2026-07-17
+
+Workspaces multi-root pra quem trabalha com multirepo, mais git no Source
+Control e novas ações de worktree.
+
+### Added
+- **Workspace multi-root:** pasta sem `.git` com repositórios dentro vira um
+  workspace só — cada repo é uma root na árvore, com branch e status próprios;
+  Sync/Pull/Push/worktree escolhem a root num submenu.
+- **Source Control:** botão-direito no arquivo — View Diff, Commit (com dialog
+  de mensagem validado), Unstage ou Discard; deletados aparecem riscados.
+- **Worktrees:** "Update from Parent" (traz a branch do pai) e "Fork Worktree"
+  (nova worktree a partir da branch do fork).
+
+### Fixed
+- Tooltips e menus de contexto abrindo fora do lugar (agora seguem o cursor e
+  respeitam o tamanho da interface).
+
+## [1.9.0] — 2026-07-17
+
+Atalhos de teclado pra navegar o workspace, além de vários acertos no terminal,
+nas Tasks e no visualizador de arquivos.
+
+### Added
+- **Selecionar aba por teclado:** ⌘1…⌘8 vão pra aba N da pane focada e ⌘9 pula
+  pra última (View → Select Tab).
+- **Navegar entre panes:** ⌘⌥ + setas move o foco pra pane vizinha na direção
+  (View → Focus Pane).
+
+### Changed
+- **Visualizador de arquivos:** os botões Format/Discard/Save saíram da barra
+  inferior — as ações seguem no menu File (e nos atalhos ⌘S / ⇧⌘F).
+- **Worktrees** passam a morar em `.cockpit/worktrees` (antes `.pi/`), com
+  `.cockpit/worktrees/` garantido no `.gitignore` do repo.
+
+### Fixed
+- **Spinner preso ao interromper o agente:** apertar ESC pra parar o harness
+  agora apaga o indicador de "trabalhando" na hora.
+- **Tasks:** o debug tab escreve "finished" ao encerrar, sinalizando o fim.
+
 ## [1.8.5] — 2026-07-16
 
 Correções de Windows: o updater não reoferece mais a mesma versão, e o
