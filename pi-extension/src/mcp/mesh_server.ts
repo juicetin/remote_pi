@@ -5,13 +5,12 @@
  * Spawned by Claude Code as an MCP server subprocess (stdio).
  * Joins the mesh through the shared `MeshNode` abstraction — the SAME
  * composition the Pi extension uses — so Claude is a first-class mesh
- * participant: it can lead the local UDS broker when no Pi/daemon is up,
- * and (as leader) bring up its own cross-PC relay bridge with its own
- * Pi-key. As a follower it rides the existing leader's bridge.
+ * participant: it can lead the local UDS broker when no Pi/daemon is up.
  *
- * Launched by `remote-pi claude` (registers this in Claude's local MCP
- * scope). Args: [--cwd <path>] [--name <agentName>] [--no-bridge]
- * Env: REMOTE_PI_MCP_CWD, REMOTE_PI_MCP_NAME
+ * Launched by `remote-pi claude` through an ephemeral MCP config.
+ * Args: [--cwd <path>] [--name <agentName>]
+ * Env: REMOTE_PI_MCP_CWD, REMOTE_PI_MCP_NAME,
+ * REMOTE_PI_MCP_LOGICAL_AGENT_ID
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -20,7 +19,7 @@ import { z } from "zod";
 import { MeshNode } from "../session/mesh_node.js";
 import { loadLocalConfig, defaultAgentName, localConfigExists } from "../session/local_config.js";
 import { sessionSockPath, sessionAuditPath, LOCAL_SESSION_NAME } from "../session/global_config.js";
-import { resolveRelayUrl } from "../config.js";
+import { MeshRegistrationError, isLogicalAgentId } from "../session/mesh_protocol.js";
 import { acquireCwdLock, type AcquiredLock } from "../session/cwd_lock.js";
 import { realpathSync } from "node:fs";
 
@@ -36,12 +35,16 @@ const _argv = process.argv.slice(2);
 // REMOTE_PI_MCP_CWD remain as explicit overrides (tests / manual launches).
 let _cwd = process.env["REMOTE_PI_MCP_CWD"] ?? process.cwd();
 let _nameOverride = process.env["REMOTE_PI_MCP_NAME"];
-let _bridgeEnabled = true;
+const _logicalAgentId = process.env["REMOTE_PI_MCP_LOGICAL_AGENT_ID"];
+if (!isLogicalAgentId(_logicalAgentId)) {
+  throw new Error(
+    "REMOTE_PI_MCP_LOGICAL_AGENT_ID is required; launch this server with remote-pi claude",
+  );
+}
 
 for (let i = 0; i < _argv.length; i++) {
   if (_argv[i] === "--cwd" && _argv[i + 1]) { _cwd = _argv[++i]!; }
   else if (_argv[i] === "--name" && _argv[i + 1]) { _nameOverride = _argv[++i]; }
-  else if (_argv[i] === "--no-bridge") { _bridgeEnabled = false; }
 }
 
 const _cfg = loadLocalConfig(_cwd);
@@ -63,8 +66,6 @@ interface IncomingMsg {
 const inbox: IncomingMsg[] = [];
 
 // ── Mesh node ─────────────────────────────────────────────────────────────────
-
-const { url: relayUrl } = resolveRelayUrl();
 
 // Diagnostics go to STDERR — stdout is the JSON-RPC channel, so writing there
 // would corrupt the MCP protocol. Claude Code captures an MCP server's stderr
@@ -95,12 +96,9 @@ try { _canonCwd = realpathSync(_cwd); } catch { /* cwd missing — use raw path 
 const mesh = new MeshNode({
   sockPath: BROKER_SOCK,
   name: AGENT_NAME,
-  cwd: _canonCwd,  // plan/38: register with (cwd, name) → address `<cwd>@<name>`
+  logicalAgentId: _logicalAgentId,
+  cwd: _canonCwd,
   auditPath: AUDIT_PATH,
-  // Own Pi-key cross-PC bridge — active only when this node leads (no Pi /
-  // daemon already hosting the broker for this cwd). As a follower the
-  // bridge stays dormant and cross-PC rides the existing leader.
-  ...(_bridgeEnabled ? { bridge: { relayUrl, cwd: _cwd } } : {}),
   // Silent: stdout is the MCP JSON-RPC channel and stderr noise isn't wanted.
   // Real failures still surface via the global handlers / fail-loud below.
   log: () => { /* no-op */ },
@@ -121,9 +119,9 @@ const mcp = new McpServer(
       `You are connected to the remote-pi agent mesh as "${AGENT_NAME}".`,
       "At the start of each turn call get_messages to check for incoming messages from other agents.",
       "Use list_peers to discover available agents.",
-      "Use agent_send to send messages — pass the exact address returned by list_peers (form `<cwd>@<name>`, `<pc>:` prefix cross-PC) VERBATIM; never build one by hand.",
+      "Use agent_send to send messages. Pass the exact `<cwd>@<name>` address returned by list_peers; never build one by hand.",
       'Use "broadcast" as the target to send to all peers in your folder (cwd) at once.',
-      "Follow the agent-network protocol (in your system prompt) for the full details (ACK statuses, replies via re, `<cwd>@<name>` addresses, cross-PC `<pc>:` prefix).",
+      "Cross-PC agent routing is disabled until logical ownership is enforced across machines.",
     ].join("\n"),
   },
 );
@@ -136,7 +134,7 @@ function notReady() {
 }
 
 mcp.registerTool("list_peers", {
-  description: "List all agents currently in the mesh (local + remote PCs).",
+  description: "List all agents currently in the same-machine mesh.",
   inputSchema: {},
 }, async () => {
   if (!meshReady) return notReady();
@@ -151,7 +149,7 @@ mcp.registerTool("list_peers", {
 mcp.registerTool("agent_send", {
   description: 'Send a message to another agent. Use "broadcast" to send to all peers.',
   inputSchema: {
-    to: z.string().describe('Peer address from list_peers (form "<cwd>@<name>", or "<pc>:<cwd>@<name>" cross-PC) echoed verbatim, or "broadcast"'),
+    to: z.string().describe('Peer address from list_peers in "<cwd>@<name>" form, or "broadcast"'),
     body: z.unknown().describe("Message body — any JSON value"),
     re: z.string().optional().describe("Optional: id of the message you are replying to"),
   },
@@ -306,11 +304,15 @@ async function tryJoinMesh(): Promise<void> {
     _joined = true;
     _lockAttempt = 0;
   } catch (e) {
-    // Got the lock but the broker join failed (e.g. socket churn). Release the
-    // lock so another contender isn't starved, then retry / fail loud.
-    _lockAttempt++;
     try { _lock.release(); } catch { /* best-effort */ }
     _lock = null;
+    if (e instanceof MeshRegistrationError) {
+      const owner = e.ownerAddress ? ` Current owner: ${e.ownerAddress}.` : "";
+      _failLoud(`mesh registration rejected: ${e.message}.${owner}`);
+    }
+    // Got the lock but the broker join failed because of socket churn. Release
+    // the lock so another contender is not starved, then retry briefly.
+    _lockAttempt++;
     if (_lockAttempt >= MAX_JOIN_ATTEMPTS) {
       _failLoud(`mesh join failed: ${String(e)}`);
     }

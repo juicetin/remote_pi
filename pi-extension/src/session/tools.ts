@@ -158,15 +158,15 @@ export function registerAgentTools(
     name: "list_peers",
     label: "List Peers",
     description:
-      "Returns the current peer inventory in this session as ADDRESSES of the " +
-      "form `<cwd>@<name>` (cross-PC peers prefixed `<pc>:`). An address is an " +
+      "Returns the current same-machine peer inventory as ADDRESSES of the " +
+      "form `<cwd>@<name>`. An address is an " +
       "opaque routing key — pass it to `agent_send`/`agent_request` VERBATIM, " +
       "never build one by hand. Use BEFORE sending whenever you're unsure who's " +
       "available, or after a `peer_joined` / `peer_left` notification to refresh " +
       "your mental model. Resolves in milliseconds — a metadata query to the " +
       "broker, not a turn of another agent.",
     promptSnippet:
-      "list_peers(): returns {peers: string[]} of addresses `<cwd>@<name>` (`<pc>:` prefix cross-PC). Echo an address verbatim to agent_send; never compose one. Cheap; call freely.",
+      "list_peers(): returns {peers: string[]} of same-machine addresses `<cwd>@<name>`. Echo an address verbatim to agent_send; never compose one. Cheap; call freely.",
     parameters: ListPeersParams,
     execute: async (_toolCallId) => {
       const peer = getSessionPeer();

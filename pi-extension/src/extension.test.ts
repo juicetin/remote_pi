@@ -12,6 +12,8 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getCapabilities, setCapabilities } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { SessionPeer } from "./session/peer.js";
+import { LOCAL_SESSION_NAME, sessionSockPath } from "./session/global_config.js";
 
 const _convertToPngMock = vi.hoisted(() => vi.fn(async () => null));
 
@@ -170,10 +172,15 @@ const {
   _setDisposedForTest,
   _resetAutoInitedForTest,
   _hasMeshNodeForTest,
+  _hasMeshBridgeForTest,
+  _getLogicalAgentIdForTest,
+  _getMeshDisabledReasonForTest,
   _getLockedNameForTest,
   _resetCwdLockForTest,
   _handleControl,
   _deliverMeshMessageToAgentForTest,
+  _buildMcpServerConfig,
+  _createMcpLogicalAgentId,
   CTRL_PREFIX,
 } = await import("./index.js");
 const { acquireCwdLock } = await import("./session/cwd_lock.js");
@@ -194,7 +201,12 @@ function makeMockPi(): { pi: ExtensionAPI; registeredCommands: string[] } {
 }
 
 function makeMockCtx(cwd = "/home/user/projects/remote_pi") {
-  return { ui: { notify: vi.fn() }, cwd, abort: vi.fn() };
+  return {
+    ui: { notify: vi.fn() },
+    cwd,
+    abort: vi.fn(),
+    sessionManager: { getSessionId: () => `test-session:${cwd}` },
+  };
 }
 
 type CmdHandler = (args: string, ctx: ReturnType<typeof makeMockCtx>) => Promise<void>;
@@ -3773,9 +3785,8 @@ describe("relay control channel + relay-state event", () => {
     expect(ev!.display).toBe(false);
     expect(ev!.details).toMatchObject({ requested: "Renamed", assigned: "Renamed", changed: false });
 
-    // Clean up: rename churns the real UDS broker (leave+rejoin) and leaves the
-    // mesh/relay live — tear down so it can't leak into later tests (an orphaned
-    // broker socket makes a subsequent bind flaky).
+    // Clean up the live mesh and relay. An orphaned broker socket makes a
+    // subsequent bind flaky.
     const stop = captureHandler("remote-pi stop");
     await stop("", makeMockCtx());
     _resetCwdLockForTest();
@@ -3880,6 +3891,143 @@ describe("same-folder same-name → #N suffix (no refusal)", () => {
       delete process.env["REMOTE_PI_DIRECT_CONFIG"];
       _resetCwdLockForTest();
     }
+  });
+});
+
+// ── canonical session ownership ─────────────────────────────────────────────
+describe("canonical Pi session identity", () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    relayRef.current = null;
+    relayInstances.length = 0;
+    _defaultConnectImpl = async () => undefined;
+    _setDisposedForTest(false);
+    _resetAutoInitedForTest();
+    _resetCwdLockForTest();
+    const stop = captureHandler("remote-pi stop");
+    await stop("", makeMockCtx());
+    _resetAutoInitedForTest();
+  });
+
+  afterEach(() => {
+    delete process.env["REMOTE_PI_DIRECT_CONFIG"];
+    delete process.env["REMOTE_PI_DAEMON"];
+    _resetCwdLockForTest();
+  });
+
+  test("session_start derives the logical agent identity from SessionManager", () => {
+    const onSessionStart = captureEventHandler("session_start");
+    const ctx = makeMockCtx("/tmp/canonical-session");
+    ctx.sessionManager.getSessionId = () => "019f67c3-84a7-78b4-ac05-a87015ea3e40";
+    onSessionStart({ type: "session_start" }, ctx);
+    expect(_getLogicalAgentIdForTest()).toBe(
+      "pi-session:019f67c3-84a7-78b4-ac05-a87015ea3e40",
+    );
+  });
+
+  test("same-machine mesh and mobile relay start without a cross-PC bridge", async () => {
+    await _connectForTest(makeMockCtx("/tmp/local-only-mesh"));
+    expect(_hasMeshNodeForTest()).toBe(true);
+    expect(relayInstances).toHaveLength(1);
+    expect(_hasMeshBridgeForTest()).toBe(false);
+  });
+
+  test("supervised daemon uses the canonical Pi SessionManager identity", async () => {
+    process.env["REMOTE_PI_DAEMON"] = "1";
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "DaemonIdentity",
+      auto_start_relay: true,
+    });
+    const onSessionStart = captureEventHandler("session_start");
+    const ctx = makeMockCtx(process.cwd());
+    ctx.sessionManager.getSessionId = () => "daemon-canonical-session";
+    onSessionStart({ type: "session_start" }, ctx);
+    await vi.waitFor(() => expect(_hasMeshNodeForTest()).toBe(true));
+    expect(_getLogicalAgentIdForTest()).toBe("pi-session:daemon-canonical-session");
+  });
+
+  test("standalone MCP receives one launch-scoped logical identity through config env", () => {
+    const firstId = _createMcpLogicalAgentId();
+    const secondId = _createMcpLogicalAgentId();
+    expect(firstId).toMatch(/^mcp-session:[0-9a-f-]+$/);
+    expect(secondId).not.toBe(firstId);
+
+    const config = _buildMcpServerConfig(
+      "/opt/remote-pi/mcp/mesh_server.js",
+      firstId,
+    );
+    expect(config.mcpServers["remote-pi-mesh"]).toMatchObject({
+      args: ["/opt/remote-pi/mcp/mesh_server.js"],
+      env: { REMOTE_PI_MCP_LOGICAL_AGENT_ID: firstId },
+    });
+  });
+
+  test("MCP config preserves one identity across subprocess starts in a launch", () => {
+    const logicalAgentId = _createMcpLogicalAgentId();
+    const config = _buildMcpServerConfig(
+      "/opt/remote-pi/mcp/mesh_server.js",
+      logicalAgentId,
+    );
+    expect(config.mcpServers["remote-pi-mesh"].env.REMOTE_PI_MCP_LOGICAL_AGENT_ID)
+      .toBe(logicalAgentId);
+  });
+
+  test("duplicate session runtime stays local while mobile relay still starts", async () => {
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "DuplicateFrontend",
+      auto_start_relay: true,
+    });
+    const sessionId = "duplicate-canonical-session";
+    const owner = new SessionPeer({
+      sockPath: sessionSockPath(LOCAL_SESSION_NAME),
+      name: "OwnerFrontend",
+      logicalAgentId: `pi-session:${sessionId}`,
+      cwd: "/tmp/duplicate-session",
+    });
+    await owner.start();
+    let ownerLeft = false;
+    try {
+      const onSessionStart = captureEventHandler("session_start");
+      const ctx = makeMockCtx("/tmp/duplicate-session");
+      ctx.sessionManager.getSessionId = () => sessionId;
+      onSessionStart({ type: "session_start" }, ctx);
+      await vi.waitFor(() => expect(relayInstances.length).toBe(1));
+
+      expect(_hasMeshNodeForTest()).toBe(false);
+      expect(_getMeshDisabledReasonForTest()).toContain("already has an active mesh connection");
+      const roster = await owner.request("broker", { type: "list_peers" });
+      expect((roster.body as { peers: string[] }).peers).toEqual([
+        "/tmp/duplicate-session@OwnerFrontend",
+      ]);
+
+      await owner.leave();
+      ownerLeft = true;
+      const root = captureHandler("remote-pi");
+      await root("", ctx);
+      expect(_hasMeshNodeForTest()).toBe(true);
+      expect(_getMeshDisabledReasonForTest()).toBeNull();
+    } finally {
+      if (!ownerLeft) await owner.leave();
+    }
+  });
+
+  test("missing session identity disables mesh but still starts the mobile relay", async () => {
+    process.env["REMOTE_PI_DIRECT_CONFIG"] = JSON.stringify({
+      agent_name: "IdentityMissing",
+      auto_start_relay: true,
+    });
+    const onSessionStart = captureEventHandler("session_start");
+    const ctx = makeMockCtx("/tmp/identity-missing");
+    ctx.sessionManager.getSessionId = () => "";
+    onSessionStart({ type: "session_start" }, ctx);
+    await vi.waitFor(() => expect(relayInstances.length).toBe(1));
+
+    expect(_hasMeshNodeForTest()).toBe(false);
+    expect(_getMeshDisabledReasonForTest()).toContain("no stable session ID");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Mobile control remains available"),
+      "error",
+    );
   });
 });
 

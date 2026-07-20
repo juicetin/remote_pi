@@ -15,10 +15,11 @@ first time it asks a couple of questions and you are done.
 
 ## Protocol & Security
 
-For wire format, identity model, ACK protocol, cross-PC routing, mesh
-membership, and the trust model (what the relay sees and doesn't see),
-read [`PROTOCOL.md`](../PROTOCOL.md) at the repo root. It is the canonical
-document — this README only covers user-facing setup.
+The local mesh ownership and rollout contract is documented in
+[`docs/mesh-ownership-v2.md`](./docs/mesh-ownership-v2.md). The repository-level
+[`PROTOCOL.md`](../PROTOCOL.md) describes the broader relay and cross-PC design.
+Cross-PC agent routing is disabled in this build until ownership can be enforced
+across machines. Mobile control through the relay remains available.
 
 ---
 

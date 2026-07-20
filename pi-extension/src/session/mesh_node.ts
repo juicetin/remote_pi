@@ -13,8 +13,9 @@ import { toWebSocketUrl } from "../config.js";
 /**
  * MeshNode — the single composition point for "join the agent mesh".
  *
- * Wraps the two layers every mesh participant needs, and nothing else
- * (pairing is app↔Pi and stays OUT of here):
+ * Wraps the local mesh and an optional cross-PC bridge. Current Pi and MCP
+ * entrypoints use only the local layer until distributed ownership is added.
+ * Pairing is app↔Pi and stays outside this class.
  *
  *   1. **Local UDS mesh** — always. A `SessionPeer` joins (or leads) the
  *      broker at `sockPath`: `send` / `sendWithAck` / `request` /
@@ -30,11 +31,8 @@ import { toWebSocketUrl } from "../config.js";
  *          with the RelayClient the host already owns (and also uses for
  *          app↔Pi pairing). MeshNode never closes an injected relay.
  *
- * Both the Pi extension and the MCP mesh server build on this so the mesh
- * wiring lives in one place. A follower never brings the bridge up —
- * cross-PC routing works transitively through whoever is leader (a Pi, the
- * daemon, or another MeshNode). On UDS failover that promotes this node to
- * leader, the bridge re-attaches automatically against the fresh broker.
+ * Consumers that opt into the bridge get leader-only attachment and automatic
+ * reattachment after UDS failover. No current runtime entrypoint opts in.
  */
 
 /** Self-managed-relay bridge config (MCP path). */
@@ -52,13 +50,10 @@ export interface MeshNodeOptions {
   sockPath: string;
   /** Requested mesh name (broker may add a #N collision suffix). */
   name: string;
-  /** Working directory, forwarded to the broker in `register` so peers are
-   *  keyed by (cwd, name) and a same-folder same-name reincarnation takes over
-   *  instead of colliding into `#N`. Optional (legacy peers omit it). */
+  /** Stable identity of one logical agent runtime. */
+  logicalAgentId: string;
+  /** Working directory used to scope the human-readable routing address. */
   cwd?: string;
-  /** Replace an existing same-(cwd,name) mesh registration. Intended for
-   *  stable process identities such as supervised daemons. */
-  takeoverExisting?: boolean;
   /** Optional audit log path passed through to SessionPeer. */
   auditPath?: string;
   /** Self-managed relay bridge — brought up if this node leads. */
@@ -104,9 +99,12 @@ export class MeshNode {
 
   constructor(opts: MeshNodeOptions) {
     this.log = opts.log ?? ((): void => {});
-    const peerOpts: SessionPeerOptions = { sockPath: opts.sockPath, name: opts.name };
+    const peerOpts: SessionPeerOptions = {
+      sockPath: opts.sockPath,
+      name: opts.name,
+      logicalAgentId: opts.logicalAgentId,
+    };
     if (opts.cwd !== undefined) peerOpts.cwd = opts.cwd;
-    if (opts.takeoverExisting !== undefined) peerOpts.takeoverExisting = opts.takeoverExisting;
     if (opts.auditPath !== undefined) peerOpts.auditPath = opts.auditPath;
     this.peer_ = new SessionPeer(peerOpts);
     if (opts.bridge) {
@@ -355,11 +353,8 @@ export class MeshNode {
   }
 
   /**
-   * Rename this peer on the broker via a soft leave+rejoin (re-registers under
-   * `newName`; the broker may append a `#N` on collision — returns the assigned
-   * name). Keeps the process + onMessage handlers alive. Does NOT touch the
-   * cross-PC bridge or the relay room — the caller must cycle the relay so the
-   * App↔Pi room (keyed by `(cwd, name)`, plan/41) follows the new name.
+   * Atomically rename this peer's routing address without releasing logical
+   * ownership. The caller cycles any name-keyed mobile relay room after success.
    */
   async rename(newName: string): Promise<string> {
     return this.peer_.rename(newName);

@@ -1,14 +1,15 @@
 ---
 name: agent-network
-description: Use when the remote-pi mesh tools (`list_peers`, `agent_send`, and — on Claude — `get_messages`) are available. You are an agent (a Claude session or a Pi coding agent) connected to the remote-pi agent mesh over a local broker. This skill teaches how to discover who's online (`list_peers`), how to send messages with a delivery ACK (`agent_send`), how incoming messages reach you (via `get_messages` on Claude, or delivered into your turn on Pi), how to reply (echo `re`), and how peer addresses work — `<cwd>@<name>` locally (echo verbatim, never compose), with a `<pc>:` prefix cross-PC.
+description: Use when the remote-pi mesh tools (`list_peers`, `agent_send`, and on Claude `get_messages`) are available. You are a Claude session or Pi coding agent connected to the same-machine remote-pi mesh. This skill covers peer discovery, delivery acknowledgements, incoming messages, replies through `re`, and opaque `<cwd>@<name>` addresses.
 ---
 
 # Agent Network (remote-pi mesh)
 
-You are connected to the **remote-pi agent mesh**. Other agents — other Claude
-sessions, Pi coding agents on this machine, and agents on the Owner's other PCs
-(reached through the relay) — can send you messages, and you can send messages
-to them.
+You are connected to the **remote-pi agent mesh**. Other Claude sessions and Pi
+coding agents on this machine can send you messages, and you can send messages
+to them. Cross-PC agent routing is disabled until logical ownership can be
+enforced across machines. Mobile control remains available through its separate
+relay path.
 
 Read this to the end before acting. The protocol is **event-driven**, not
 request/reply. Getting the receive model wrong leaves coordination broken.
@@ -58,7 +59,6 @@ list_peers()
 → /Users/jo/acme/backend@backend
   /Users/jo/acme/backend@reviewer
   /Users/jo/acme/web@web
-  casa:/Users/jo/acme/api@api
 ```
 
 Synchronous (resolves in milliseconds — not another agent's turn). Use it:
@@ -71,9 +71,8 @@ Synchronous (resolves in milliseconds — not another agent's turn). Use it:
 wake your turn. When your view feels stale, just call `list_peers` again — it's
 the authoritative snapshot. Don't expect `peer_joined`/`peer_left` events.
 
-**Each entry is an ADDRESS, not a bare name.** The form is `<cwd>@<name>`
-(with an optional `<pc>:` prefix for cross-PC peers). Read it by splitting on
-the `@`:
+**Each entry is an ADDRESS, not a bare name.** The form is `<cwd>@<name>`.
+Read it by splitting on the `@`:
 
 - **after the `@` → the name** (`Orquestrador`, `App`, `backend`). It's a safe
   token: it never contains a space, `/`, `:`, `#` or `@` — those are normalized
@@ -217,32 +216,10 @@ order — use `re` to identify what each reply answers.
 
 ---
 
-## Cross-PC addressing (`<pc>:<cwd>@<name>`)
+## Cross-PC routing
 
-When the Owner has paired multiple PCs, remote peers appear with a `<pc>:` prefix
-on the address:
-
-```
-list_peers() → /Users/jo/acme/backend@backend  casa:/Users/jo/acme/api@api
-```
-
-Send to a remote peer with its address verbatim:
-
-```
-agent_send({ to: "casa:/Users/jo/acme/api@api", body: { ... } })
-```
-
-The relay routes it across the mesh; `received | denied | timeout` semantics
-are identical to local. When you **reply** to a cross-PC message, use the
-sender's `from` verbatim (it already carries the `<pc>:` prefix) as your `to`.
-You never prefix your own address — the broker handles that.
-
-Cross-PC failure notes:
-- `denied` → the remote broker has no peer at that address (left, or stale cache
-  → call `list_peers` again).
-- `timeout` → the other PC is offline or the relay is unreachable. The relay
-  may also synthesise a `transport_error` reply (`from: "_relay"`,
-  `body.type: "transport_error"`) — treat exactly like timeout.
+Cross-PC agent routing is unavailable in this build. Do not construct or send
+to `<pc>:` addresses. Use only addresses returned by `list_peers`.
 
 ---
 
@@ -287,16 +264,16 @@ inbox on a later turn. (Claude has no `agent_request` — use `agent_send`.)
 
 1. **Every turn**: read your inbox first — `get_messages()` on Claude; on Pi
    messages arrive as turn input automatically.
-2. **Discover**: `list_peers()` → addresses `<cwd>@<name>` (local) + `<pc>:…`
-   (cross-PC). Echo verbatim, never compose. Synchronous, self-excluded.
+2. **Discover**: `list_peers()` returns same-machine `<cwd>@<name>` addresses.
+   Echo them verbatim and never compose one. Synchronous, self-excluded.
    Presence is pull-based — join/leave don't wake you.
 3. **Send**: `agent_send({to, body, re?})` → inspect the status.
 4. **Unicast status**: `received | denied | timeout`. Delivery is reliable —
    `received` even if the peer is mid-turn (its harness queues it); abandon on
    `denied`; investigate on `timeout`. No retry-on-busy.
 5. **Broadcast/multicast**: status `sent`. Fire-and-forget.
-6. **Reply**: set `re` to their `id`, `to` to their `from` (the full address,
-   prefix and all). `re` is correlation only.
+6. **Reply**: set `re` to their `id` and `to` to their full `from` address.
+   `re` is correlation only.
 7. You never receive your own messages.
 
 Re-read when in doubt.
